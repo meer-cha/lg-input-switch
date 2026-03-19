@@ -18,7 +18,7 @@ The fix is to bypass the Windows DDC/CI stack entirely and write the raw I2C pac
 
 ### Option A — pre-built executables (no Python required)
 
-1. Go to the [Releases](https://github.com/meer-cha/lg-input-switch/releases) page and download the `.zip` from the latest release
+1. Go to the [Releases](https://github.com/meer-cha/lg-input-switch/releases) page and download the `.zip` from the latest release (not the "Source code (zip)")
 2. Create a new folder anywhere (e.g. `C:\Users\You\LG Input Switch`)
 3. Extract the contents of the zip into that folder
 4. Run `lg-input-switch.exe` — it will guide you through setup on the first run, then start listening for your hotkey
