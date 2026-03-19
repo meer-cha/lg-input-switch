@@ -697,6 +697,8 @@ def cmd_daemon() -> None:
         f"  {_RED}Ctrl+C{_RESET}{_DIM} exit{_RESET}"
         f"   {_YELLOW}ESC{_RESET}{_DIM} reconfigure{_RESET}"
     )
+    print()
+    print(f"  {_YELLOW}Keep this window open{_RESET}{_DIM} (minimized is fine) — closing it stops the hotkey.{_RESET}")
 
     PM_REMOVE  = 0x0001
     reconfigure = False

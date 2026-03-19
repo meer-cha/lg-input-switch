@@ -23,6 +23,8 @@ The fix is to bypass the Windows DDC/CI stack entirely and write the raw I2C pac
 3. Extract the contents of the zip into that folder
 4. Run `lg-input-switch.exe` — it will guide you through setup on the first run, then start listening for your hotkey
 
+> **Keep the window open.** The hotkey only works while the console window is running. You can minimize it — but closing it stops the hotkey listener. Minimizing to the system tray is not supported.
+
 ### Option B — run from source
 
 Requires Python 3.10+. No third-party packages needed.
@@ -64,7 +66,7 @@ On the first run it will walk you through choosing your two inputs and hotkey, t
 >
 > **Note:** Windows startup is untested — there are known issues with startup apps on some Windows installations that may prevent it from working reliably.
 
-> **Console window:** the app runs in a console window that must remain open (minimized is fine). Minimizing to the system tray is not supported.
+> **Console window:** the hotkey listener only works while the console window is running — you can minimize it, but closing it stops the listener. Minimizing to the system tray is not supported.
 
 ### From source
 
