@@ -7,8 +7,10 @@ import argparse
 import ctypes
 import ctypes.wintypes
 import json
+import msvcrt
 import sys
 import time
+import winreg
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -117,6 +119,46 @@ def parse_hotkey(hotkey: str) -> tuple[int, int]:
             raise ValueError(f"unrecognised hotkey token: '{token}'")
     if vk is None:
         raise ValueError(f"hotkey has no non-modifier key: '{hotkey}'")
+
+    _FKEY_VKS = frozenset(range(0x70, 0x7C))  # VK_F1–VK_F12
+
+    if mods == 0 and vk == VK_CODES["esc"]:
+        raise ValueError(
+            "esc alone cannot be used as a hotkey — it is reserved for reconfiguring"
+        )
+    if mods == 0 and vk not in _FKEY_VKS:
+        raise ValueError(
+            "hotkey must include at least one modifier (ctrl, shift, alt, or win) "
+            "to avoid intercepting regular typing"
+        )
+
+    # Block shift-only with any key that produces a typed character when shifted
+    # (shift+/ = ?, shift+a = A, shift+1 = !, etc.)
+    _SHIFTABLE_VKS = (
+        frozenset(range(0x41, 0x5B)) |          # a–z
+        frozenset(range(0x30, 0x3A)) |          # 0–9
+        {0xBA, 0xBB, 0xBC, 0xBD, 0xBE, 0xBF,   # OEM symbols (; = , - . /)
+         0xC0, 0xDB, 0xDC, 0xDD, 0xDE}         # OEM symbols (` [ \ ] ')
+    )
+    if mods == MODIFIERS["shift"] and vk in _SHIFTABLE_VKS:
+        raise ValueError(
+            "shift alone with a character key would intercept normal typing "
+            "(e.g. shift+/ types ?) — add another modifier like ctrl or alt"
+        )
+
+    # Block well-known shortcuts that would silently break normal workflow
+    _BLOCKED: dict[tuple[int, int], str] = {
+        (MODIFIERS["ctrl"], VK_CODES["c"]): "ctrl+c is reserved for stopping the daemon",
+        (MODIFIERS["ctrl"], VK_CODES["v"]): "ctrl+v is a common paste shortcut",
+        (MODIFIERS["ctrl"], VK_CODES["x"]): "ctrl+x is a common cut shortcut",
+        (MODIFIERS["ctrl"], VK_CODES["z"]): "ctrl+z is a common undo shortcut",
+        (MODIFIERS["ctrl"], VK_CODES["a"]): "ctrl+a is a common select all shortcut",
+        (MODIFIERS["ctrl"], VK_CODES["s"]): "ctrl+s is a common save shortcut",
+    }
+    reason = _BLOCKED.get((mods, vk))
+    if reason:
+        raise ValueError(f"{reason} — choose a different combination")
+
     return mods, vk
 
 
@@ -151,6 +193,99 @@ def _load_config() -> dict:
 
 def _save_config(cfg: dict) -> None:
     CONFIG_PATH.write_text(json.dumps(cfg, indent=2) + "\n")
+
+
+# ---------------------------------------------------------------------------
+# Windows startup (HKCU registry — no admin rights required)
+# ---------------------------------------------------------------------------
+_STARTUP_REG_KEY  = r"Software\Microsoft\Windows\CurrentVersion\Run"
+_STARTUP_REG_NAME = "lg-input-switch"
+
+
+def _get_startup() -> bool:
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _STARTUP_REG_KEY) as key:
+            winreg.QueryValueEx(key, _STARTUP_REG_NAME)
+            return True
+    except FileNotFoundError:
+        return False
+
+
+def _set_startup(enabled: bool) -> None:
+    with winreg.OpenKey(
+        winreg.HKEY_CURRENT_USER, _STARTUP_REG_KEY, 0, winreg.KEY_SET_VALUE
+    ) as key:
+        if enabled:
+            winreg.SetValueEx(key, _STARTUP_REG_NAME, 0, winreg.REG_SZ, sys.executable)
+        else:
+            try:
+                winreg.DeleteValue(key, _STARTUP_REG_NAME)
+            except FileNotFoundError:
+                pass
+
+
+def _prompt_startup() -> bool:
+    """Ask whether to enable/disable running at Windows startup.
+    Returns True if ESC was pressed (go back), False otherwise."""
+    currently = _get_startup()
+    action    = "Disable startup" if currently else "Enable startup"
+    options   = [action, "Leave as is"]
+    idx       = 0
+    n_lines   = len(options) + 1   # option rows + hints row
+
+    def render(first: bool = False) -> None:
+        if not first:
+            sys.stdout.write(f"\033[{n_lines}A")
+        for i, label in enumerate(options):
+            if i == idx:
+                line = f"  {_GREEN}>{_RESET} {_CYAN}{_BOLD}{label}{_RESET}"
+            else:
+                line = f"    {_DIM}{label}{_RESET}"
+            sys.stdout.write(f"\033[2K{line}\n")
+        hints = (
+            f"  {_YELLOW}↑ ↓{_RESET}{_DIM} navigate{_RESET}"
+            f"   {_YELLOW}↵{_RESET}{_DIM} select{_RESET}"
+            f"   {_YELLOW}ESC{_RESET}{_DIM} go back{_RESET}"
+        )
+        sys.stdout.write(f"\033[2K{hints}\n")
+        sys.stdout.flush()
+
+    _clear()
+    status = f"{_GREEN}enabled{_RESET}" if currently else f"{_DIM}disabled{_RESET}"
+    print(f"{_BOLD}Start with Windows{_RESET}  (currently {status})\n")
+    print(
+        f"  {_YELLOW}Note:{_RESET}{_DIM} selecting '{action}' will write a value to your"
+        f" Windows registry under{_RESET}"
+    )
+    print(f"  {_DIM}HKCU\\{_STARTUP_REG_KEY}{_RESET}")
+    print(f"  {_DIM}No admin rights required. You can change this at any time by pressing ESC to reconfigure.{_RESET}")
+    print()
+
+    sys.stdout.write("\033[?25l")
+    sys.stdout.flush()
+    render(first=True)
+
+    try:
+        while True:
+            ch = msvcrt.getch()
+            if ch in (b"\xe0", b"\x00"):
+                ch2 = msvcrt.getch()
+                if ch2 == b"H":
+                    idx = (idx - 1) % len(options)
+                    render()
+                elif ch2 == b"P":
+                    idx = (idx + 1) % len(options)
+                    render()
+            elif ch == b"\r":
+                if idx == 0:
+                    _set_startup(not currently)
+                _clear()
+                return False
+            elif ch == b"\x1b":
+                return True   # go back
+    finally:
+        sys.stdout.write("\033[?25h")
+        sys.stdout.flush()
 
 
 def log(msg: str) -> None:
@@ -339,50 +474,210 @@ def _i2c_write(lib: ctypes.CDLL, gpu, masks: list[int], packet: list[int]) -> bo
 # ---------------------------------------------------------------------------
 # configure / daemon commands
 # ---------------------------------------------------------------------------
-def cmd_configure() -> None:
-    """Interactive setup — writes config.json."""
-    print("Available inputs:", ", ".join(INPUTS))
+_RESET   = "\033[0m"
+_BOLD    = "\033[1m"
+_DIM     = "\033[2m"
+_RED     = "\033[91m"
+_GREEN   = "\033[92m"
+_YELLOW  = "\033[93m"
+_CYAN    = "\033[96m"
+_MAGENTA = "\033[95m"
+
+
+def _clear() -> None:
+    sys.stdout.write("\033[2J\033[H")
+    sys.stdout.flush()
+
+
+def _fmt_hotkey(raw: str) -> str:
+    return f"{_MAGENTA}{raw}{_RESET}"
+
+
+def _fmt_input(key: str) -> str:
+    return f"{_CYAN}{_BOLD}{key}{_RESET}"
+
+
+def _show_context(ctx: dict) -> None:
+    for label, value in ctx.items():
+        print(f"  {_DIM}{label}:{_RESET} {value}")
     print()
 
-    def prompt_input(label: str, exclude: str | None = None) -> str:
-        while True:
-            val = input(f"{label}: ").strip().lower()
-            if val not in INPUTS:
-                print(f"  Invalid input '{val}'. Choose from: {', '.join(INPUTS)}")
-                continue
-            if exclude is not None and val == exclude:
-                print(f"  Second input must differ from the first ('{exclude}').")
-                continue
-            return val
 
-    first  = prompt_input("First input")
-    second = prompt_input("Second input", exclude=first)
+def _pick_input(prompt: str, exclude: str | None = None,
+                ctx: dict | None = None, allow_back: bool = True) -> str | None:
+    """Arrow-key selector. Returns chosen key, or None if ESC pressed."""
+    options = [k for k in INPUTS if k != exclude]
+    idx     = 0
+    n_lines = len(options) + 1   # option rows + hints row
+
+    def render(first: bool = False) -> None:
+        if not first:
+            sys.stdout.write(f"\033[{n_lines}A")
+        for i, key in enumerate(options):
+            label = INPUTS[key][1]
+            if i == idx:
+                line = f"  {_GREEN}>{_RESET} {_CYAN}{_BOLD}{key:<8}{_RESET} {_CYAN}{label}{_RESET}"
+            else:
+                line = f"    {_DIM}{key:<8} {label}{_RESET}"
+            sys.stdout.write(f"\033[2K{line}\n")
+        esc_desc = "exit" if not allow_back else "go back"
+        hints = (
+            f"  {_YELLOW}↑ ↓{_RESET}{_DIM} navigate{_RESET}"
+            f"   {_YELLOW}↵{_RESET}{_DIM} select{_RESET}"
+            f"   {_YELLOW}ESC{_RESET}{_DIM} {esc_desc}{_RESET}"
+        )
+        sys.stdout.write(f"\033[2K{hints}\n")
+        sys.stdout.flush()
+
+    _clear()
+    if ctx:
+        _show_context(ctx)
+    print(f"{_BOLD}{prompt}{_RESET}\n")
+    sys.stdout.write("\033[?25l")
+    sys.stdout.flush()
+    render(first=True)
+
+    try:
+        while True:
+            ch = msvcrt.getch()
+            if ch in (b"\xe0", b"\x00"):
+                ch2 = msvcrt.getch()
+                if ch2 == b"H":
+                    idx = (idx - 1) % len(options)
+                    render()
+                elif ch2 == b"P":
+                    idx = (idx + 1) % len(options)
+                    render()
+            elif ch == b"\r":
+                return options[idx]
+            elif ch == b"\x1b":
+                return None
+    finally:
+        sys.stdout.write("\033[?25h")
+        sys.stdout.flush()
+
+
+def _prompt_hotkey(ctx: dict | None = None, error: str | None = None) -> str | None:
+    """Read a hotkey string character by character. Returns raw string or None if ESC pressed."""
+    _clear()
+    if ctx:
+        _show_context(ctx)
+    _example = "ctrl+shift+d"
+    _tokens  = _example.split("+")
+    _parts   = [f"{_RESET}{_MAGENTA}{t}{_RESET}" for t in _tokens]
+    _listed  = (
+        f"{_DIM}, {_RESET}".join(_parts[:-1]) + f"{_DIM} and {_RESET}" + _parts[-1]
+    )
+    print(f"{_BOLD}Hotkey — type it as text, e.g. {_fmt_hotkey(_example)}{_BOLD}:{_RESET}")
+    print(f"  {_DIM}the toggle will trigger when you press {_RESET}{_listed}{_DIM} together{_RESET}")
+    hints = (
+        f"  {_YELLOW}↵{_RESET}{_DIM} confirm{_RESET}"
+        f"   {_YELLOW}ESC{_RESET}{_DIM} go back{_RESET}"
+    )
+    print(hints)
+    if error:
+        print(f"\n  {_YELLOW}{error}{_RESET}")
+    sys.stdout.write(f"\n  {_MAGENTA}")
+    sys.stdout.flush()
+
+    chars: list[str] = []
+    try:
+        while True:
+            ch = msvcrt.getch()
+            if ch == b"\x1b":
+                return None
+            elif ch == b"\r":
+                sys.stdout.write(_RESET + "\n")
+                sys.stdout.flush()
+                return "".join(chars)
+            elif ch in (b"\xe0", b"\x00"):
+                msvcrt.getch()  # discard arrow key second byte
+            elif ch == b"\x08":  # backspace
+                if chars:
+                    chars.pop()
+                    sys.stdout.write("\b \b")
+                    sys.stdout.flush()
+            elif 0x20 <= ch[0] <= 0x7E:
+                c = ch.decode("latin-1")
+                chars.append(c)
+                sys.stdout.write(c)
+                sys.stdout.flush()
+    finally:
+        sys.stdout.write(_RESET)
+        sys.stdout.flush()
+
+
+def cmd_configure() -> None:
+    """Interactive setup — writes config.json."""
+    current      = None
+    target       = None
+    step         = 0
+    hotkey_error = None
 
     while True:
-        raw = input("Hotkey — type it as text, e.g. ctrl+shift+d: ").strip()
-        try:
-            parse_hotkey(raw)
-            break
-        except ValueError as exc:
-            print(f"  {exc}")
+        if step == 0:
+            result = _pick_input("Which input are you currently on?", allow_back=False)
+            if result is None:   # ESC on first step = exit
+                _clear()
+                print("Exiting setup.")
+                sys.exit(0)
+            current      = result
+            hotkey_error = None
+            step         = 1
 
-    cfg = {"hotkey": raw, "inputs": [first, second]}
+        elif step == 1:
+            result = _pick_input(
+                "Which input do you want to toggle to?",
+                exclude=current,
+                ctx={"Currently on": _fmt_input(current)},
+            )
+            if result is None:   # ESC = go back
+                step = 0
+            else:
+                target       = result
+                hotkey_error = None
+                step         = 2
+
+        elif step == 2:
+            result = _prompt_hotkey(
+                ctx={
+                    "Currently on": _fmt_input(current),
+                    "Toggles to":   _fmt_input(target),
+                },
+                error=hotkey_error,
+            )
+            if result is None:   # ESC = go back
+                hotkey_error = None
+                step         = 1
+                continue
+            raw = result.strip()
+            if not raw:
+                hotkey_error = "Hotkey cannot be empty."
+                continue
+            try:
+                parse_hotkey(raw)
+                break
+            except ValueError as exc:
+                hotkey_error = str(exc)
+
+    cfg = {"hotkey": raw, "inputs": [current, target], "last_input": current}
     _save_config(cfg)
-    print(f"\nSaved to {CONFIG_PATH}")
-    print(f"  hotkey : {raw}")
-    print(f"  inputs : {first} ↔ {second}")
+    _clear()
+    print(f"  {_DIM}hotkey :{_RESET} {_fmt_hotkey(raw)}")
+    print(f"  {_DIM}toggle :{_RESET} {_fmt_input(current)} {_DIM}↔{_RESET} {_fmt_input(target)}")
+    print()
 
 
 def cmd_daemon() -> None:
     """Listen for the configured hotkey and toggle between two inputs."""
-    cfg   = _load_config()
+    cfg      = _load_config()
     mods, vk = parse_hotkey(cfg["hotkey"])
     inputs   = cfg["inputs"]
 
     lib        = _load_nvapi()
     gpu, masks = _nvapi_setup(lib)
 
-    user32 = ctypes.WinDLL("user32")
+    user32    = ctypes.WinDLL("user32")
     WM_HOTKEY = 0x0312
     HOTKEY_ID = 1
 
@@ -392,24 +687,39 @@ def cmd_daemon() -> None:
             "(already in use by another application?)"
         )
 
-    print(f"Listening for {cfg['hotkey']} — Ctrl+C to exit")
-    print(f"  will toggle between: {inputs[0]} ↔ {inputs[1]}")
+    print(f"Listening for {_fmt_hotkey(cfg['hotkey'])}")
+    print(
+        f"  will toggle between:"
+        f" {_fmt_input(inputs[0])} {_DIM}↔{_RESET} {_fmt_input(inputs[1])}"
+    )
+    print()
+    print(
+        f"  {_RED}Ctrl+C{_RESET}{_DIM} exit{_RESET}"
+        f"   {_YELLOW}ESC{_RESET}{_DIM} reconfigure{_RESET}"
+    )
 
-    PM_REMOVE = 0x0001
+    PM_REMOVE  = 0x0001
+    reconfigure = False
     msg = ctypes.wintypes.MSG()
     try:
         while True:
             # PeekMessageW + sleep instead of blocking GetMessageW so that
             # Ctrl+C (SIGINT) can be delivered between iterations.
             if not user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, PM_REMOVE):
-                time.sleep(0.05)
+                if msvcrt.kbhit():
+                    ch = msvcrt.getch()
+                    if ch == b"\x1b":
+                        reconfigure = True
+                        break
+                else:
+                    time.sleep(0.05)
                 continue
             if msg.message == 0x0012:  # WM_QUIT
                 break
             if msg.message != WM_HOTKEY:
                 continue
 
-            last = cfg.get("last_input")
+            last   = cfg.get("last_input")
             target = inputs[1] if last == inputs[0] else inputs[0]
 
             value, label = INPUTS[target]
@@ -417,15 +727,20 @@ def cmd_daemon() -> None:
             log(f"[debug] packet: {[f'0x{b:02X}' for b in packet]}")
 
             if _i2c_write(lib, gpu, masks, packet):
-                print(f"switched to {label}")
+                print(f"switched to {_fmt_input(target)} {_DIM}({label}){_RESET}")
                 cfg["last_input"] = target
                 _save_config(cfg)
             else:
-                print(f"error: failed to switch to {label} — run with --verbose for details")
+                print(
+                    f"{_YELLOW}error: failed to switch to {label}"
+                    f" — run with --verbose for details{_RESET}"
+                )
     except KeyboardInterrupt:
-        print("\nexiting")
+        print(f"\n{_RED}exiting{_RESET}")
     finally:
         user32.UnregisterHotKey(None, HOTKEY_ID)
+
+    return reconfigure
 
 
 # ---------------------------------------------------------------------------

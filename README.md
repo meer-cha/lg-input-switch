@@ -18,10 +18,10 @@ The fix is to bypass the Windows DDC/CI stack entirely and write the raw I2C pac
 
 ### Option A — pre-built executables (no Python required)
 
-1. Go to the [Releases](https://github.com/meer-cha/lg-input-switch/releases) page
-2. Download `lg-configure.exe` and `lg-daemon.exe` from the latest release
-3. Put both files in the same folder
-4. Run `lg-configure.exe` first to set up your hotkey, then `lg-daemon.exe` to start listening
+1. Go to the [Releases](https://github.com/meer-cha/lg-input-switch/releases) page and download the `.zip` from the latest release
+2. Create a new folder anywhere (e.g. `C:\Users\You\LG Input Switch`)
+3. Extract the contents of the zip into that folder
+4. Run `lg-input-switch.exe` — it will guide you through setup on the first run, then start listening for your hotkey
 
 ### Option B — run from source
 
@@ -48,23 +48,19 @@ The executables will be in the `dist\` folder.
 
 ## Usage
 
-### Standalone executables
-
-**Step 1 — configure** (run once):
+### Standalone executable
 
 ```
-lg-configure.exe
+lg-input-switch.exe
 ```
 
-Follow the prompts: choose two inputs and type a hotkey as text (e.g. `ctrl+shift+d`). This writes a `config.json` file in the same folder as the executables.
+On the first run it will walk you through choosing your two inputs and hotkey, then immediately start listening. On every subsequent run it goes straight to listening.
 
-**Step 2 — run the daemon:**
+- Press `ESC` at any time to reconfigure your inputs or hotkey — you'll also be offered the option to enable or disable running at Windows startup
+- Press `Ctrl+C` to exit
+- The last active input is remembered so it always picks up where it left off
 
-```
-lg-daemon.exe
-```
-
-The daemon registers the hotkey system-wide and listens in the background. Each press toggles between your two configured inputs. Press `Ctrl+C` to exit. The last active input is saved to `config.json` so the daemon picks up from the right state after a restart.
+> **Windows startup:** after setup you'll be asked whether to start automatically with Windows. This writes a single value to `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` — no admin rights required. You can enable or disable it at any time by pressing `ESC` to reconfigure and navigating back to the startup screen.
 
 ### From source
 
@@ -118,6 +114,13 @@ Type the hotkey as `+`-separated tokens — do **not** press the keys, type the 
 
 Examples: `ctrl+shift+d`, `alt+f1`, `ctrl+numpad1`, `ctrl+shift+;`
 
+#### Hotkey restrictions
+
+- At least one modifier (`ctrl`, `shift`, `alt`, or `win`) is required — except F-keys (`f1`–`f12`) which may be used alone
+- `shift` alone with a typeable character is blocked (e.g. `shift+/` just types `?`)
+- The following are reserved and cannot be used: `esc` (reconfigure), `ctrl+c` (exit)
+- Common Windows shortcuts are blocked: `ctrl+v`, `ctrl+x`, `ctrl+z`, `ctrl+a`, `ctrl+s`
+
 ## How it works
 
 DDC/CI uses I2C to send monitor control commands. A `SetVCP` packet to switch inputs looks like this:
@@ -150,7 +153,7 @@ The LG also uses a **proprietary VCP code `0xF4`** for input selection rather th
 
 **Daemon hotkey does nothing** — another application may have registered the same hotkey. Try a different combination.
 
-**`config.json` not found when running daemon** — run `lg-configure.exe` (or `python lg_switch.py configure`) first.
+**Want to change inputs or hotkey** — press `ESC` while the daemon is running to reconfigure.
 
 ## Credits
 

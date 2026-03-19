@@ -1,6 +1,5 @@
 @echo off
 pip install pyinstaller
-pyinstaller --onefile --console --name lg-configure lg_configure.py
-pyinstaller --onefile --console --name lg-daemon    lg_daemon.py
+pyinstaller --onefile --console --name lg-input-switch lg_input_switch_launcher.py
 echo.
-echo Done. Executables are in the dist\ folder.
+echo Done. Executable is in the dist\ folder.
