@@ -61,6 +61,10 @@ On the first run it will walk you through choosing your two inputs and hotkey, t
 - The last active input is remembered so it always picks up where it left off
 
 > **Windows startup:** after setup you'll be asked whether to start automatically with Windows. This writes a single value to `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` — no admin rights required. You can enable or disable it at any time by pressing `ESC` to reconfigure and navigating back to the startup screen.
+>
+> **Note:** Windows startup is untested — there are known issues with startup apps on some Windows installations that may prevent it from working reliably.
+
+> **Console window:** the app runs in a console window that must remain open (minimized is fine). Minimizing to the system tray is not supported.
 
 ### From source
 
