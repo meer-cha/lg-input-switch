@@ -5,7 +5,13 @@ lg-switch — LG 45GX950A-B input switcher for Windows
 
 import argparse
 import ctypes
+import ctypes.wintypes
+import json
+import msvcrt
 import sys
+import time
+import winreg
+from pathlib import Path
 
 # ---------------------------------------------------------------------------
 # Input source values (LG-specific, sent via proprietary VCP code 0xF4)
@@ -22,7 +28,264 @@ DDC_DEVICE_ADDR = 0x6E    # 0x37 << 1  (DDC/CI destination address)
 NVAPI_OK        = 0
 NVAPI_MAX_GPUS  = 64
 
+CONFIG_PATH = (
+    Path(sys.executable).parent / "config.json"
+    if getattr(sys, "frozen", False)          # running as PyInstaller .exe
+    else Path(__file__).parent / "config.json"
+)
+
 _verbose = False
+
+# ---------------------------------------------------------------------------
+# Hotkey parsing (Win32 RegisterHotKey)
+# ---------------------------------------------------------------------------
+MODIFIERS: dict[str, int] = {
+    "ctrl":    0x0002,
+    "control": 0x0002,
+    "alt":     0x0001,
+    "shift":   0x0004,
+    "win":     0x0008,
+}
+MOD_NOREPEAT = 0x4000
+
+VK_CODES: dict[str, int] = {
+    **{chr(c): 0x41 + i for i, c in enumerate(range(ord("a"), ord("z") + 1))},
+    **{str(d): 0x30 + d for d in range(10)},
+    **{f"f{n}": 0x6F + n for n in range(1, 13)},
+    "space":    0x20,
+    "enter":    0x0D,
+    "esc":      0x1B,
+    "escape":   0x1B,
+    "tab":      0x09,
+    "insert":   0x2D,
+    "delete":   0x2E,
+    "home":     0x24,
+    "end":      0x23,
+    "pageup":   0x21,
+    "pagedown": 0x22,
+    "left":     0x25,
+    "right":    0x27,
+    "up":       0x26,
+    "down":     0x28,
+    **{f"numpad{d}": 0x60 + d for d in range(10)},
+    "numpad*": 0x6A, "numpadmultiply": 0x6A,
+    "numpad+": 0x6B, "numpadadd":      0x6B,
+    "numpad-": 0x6D, "numpadsubtract": 0x6D,
+    "numpad.": 0x6E, "numpaddecimal":  0x6E,
+    "numpad/": 0x6F, "numpaddivide":   0x6F,
+    # OEM symbols (US layout)
+    ";":  0xBA, ":":  0xBA,
+    "=":  0xBB, "+":  0xBB,
+    ",":  0xBC, "<":  0xBC,
+    "-":  0xBD, "_":  0xBD,
+    ".":  0xBE, ">":  0xBE,
+    "/":  0xBF, "?":  0xBF,
+    "`":  0xC0, "~":  0xC0,
+    "[":  0xDB, "{":  0xDB,
+    "\\": 0xDC, "|":  0xDC,
+    "]":  0xDD, "}":  0xDD,
+    "'":  0xDE, "\"": 0xDE,
+}
+
+
+def parse_hotkey(hotkey: str) -> tuple[int, int]:
+    """Parse 'ctrl+shift+d' into (modifier_flags, vk_code). Raises ValueError on bad input.
+
+    Handles '+' as the key itself: 'ctrl++' or 'ctrl+shift++' — consecutive '+' signs
+    (which produce empty tokens after split) are collapsed into a single '+' token.
+    """
+    raw_tokens = hotkey.split("+")
+    # Collapse runs of empty strings (produced by ++ in input) into a single "+" token
+    tokens = []
+    i = 0
+    while i < len(raw_tokens):
+        if raw_tokens[i] == "":
+            tokens.append("+")
+            while i < len(raw_tokens) and raw_tokens[i] == "":
+                i += 1
+        else:
+            tokens.append(raw_tokens[i].strip().lower())
+            i += 1
+    mods = 0
+    vk   = None
+    for token in tokens:
+        if token in MODIFIERS:
+            mods |= MODIFIERS[token]
+        elif token in VK_CODES:
+            if vk is not None:
+                raise ValueError(f"multiple non-modifier keys in hotkey: '{hotkey}'")
+            vk = VK_CODES[token]
+        else:
+            raise ValueError(f"unrecognised hotkey token: '{token}'")
+    if vk is None:
+        raise ValueError(f"hotkey has no non-modifier key: '{hotkey}'")
+
+    _FKEY_VKS = frozenset(range(0x70, 0x7C))  # VK_F1–VK_F12
+
+    if mods == 0 and vk == VK_CODES["esc"]:
+        raise ValueError(
+            "esc alone cannot be used as a hotkey — it is reserved for reconfiguring"
+        )
+    if mods == 0 and vk not in _FKEY_VKS:
+        raise ValueError(
+            "hotkey must include at least one modifier (ctrl, shift, alt, or win) "
+            "to avoid intercepting regular typing"
+        )
+
+    # Block shift-only with any key that produces a typed character when shifted
+    # (shift+/ = ?, shift+a = A, shift+1 = !, etc.)
+    _SHIFTABLE_VKS = (
+        frozenset(range(0x41, 0x5B)) |          # a–z
+        frozenset(range(0x30, 0x3A)) |          # 0–9
+        {0xBA, 0xBB, 0xBC, 0xBD, 0xBE, 0xBF,   # OEM symbols (; = , - . /)
+         0xC0, 0xDB, 0xDC, 0xDD, 0xDE}         # OEM symbols (` [ \ ] ')
+    )
+    if mods == MODIFIERS["shift"] and vk in _SHIFTABLE_VKS:
+        raise ValueError(
+            "shift alone with a character key would intercept normal typing "
+            "(e.g. shift+/ types ?) — add another modifier like ctrl or alt"
+        )
+
+    # Block well-known shortcuts that would silently break normal workflow
+    _BLOCKED: dict[tuple[int, int], str] = {
+        (MODIFIERS["ctrl"], VK_CODES["c"]): "ctrl+c is reserved for stopping the daemon",
+        (MODIFIERS["ctrl"], VK_CODES["v"]): "ctrl+v is a common paste shortcut",
+        (MODIFIERS["ctrl"], VK_CODES["x"]): "ctrl+x is a common cut shortcut",
+        (MODIFIERS["ctrl"], VK_CODES["z"]): "ctrl+z is a common undo shortcut",
+        (MODIFIERS["ctrl"], VK_CODES["a"]): "ctrl+a is a common select all shortcut",
+        (MODIFIERS["ctrl"], VK_CODES["s"]): "ctrl+s is a common save shortcut",
+    }
+    reason = _BLOCKED.get((mods, vk))
+    if reason:
+        raise ValueError(f"{reason} — choose a different combination")
+
+    return mods, vk
+
+
+# ---------------------------------------------------------------------------
+# Config file helpers
+# ---------------------------------------------------------------------------
+def _load_config() -> dict:
+    if not CONFIG_PATH.exists():
+        sys.exit(
+            f"error: config.json not found — run 'python lg_switch.py configure' first"
+        )
+    try:
+        cfg = json.loads(CONFIG_PATH.read_text())
+    except json.JSONDecodeError as exc:
+        sys.exit(f"error: config.json is not valid JSON: {exc}")
+
+    for key in ("hotkey", "inputs"):
+        if key not in cfg:
+            sys.exit(f"error: config.json is missing '{key}' — re-run configure")
+    if not isinstance(cfg["inputs"], list) or len(cfg["inputs"]) != 2:
+        sys.exit("error: config.json 'inputs' must be a list of exactly two input names")
+    for inp in cfg["inputs"]:
+        if inp not in INPUTS:
+            sys.exit(f"error: config.json contains unknown input '{inp}'")
+    try:
+        parse_hotkey(cfg["hotkey"])
+    except ValueError as exc:
+        sys.exit(f"error: config.json hotkey invalid: {exc}")
+
+    return cfg
+
+
+def _save_config(cfg: dict) -> None:
+    CONFIG_PATH.write_text(json.dumps(cfg, indent=2) + "\n")
+
+
+# ---------------------------------------------------------------------------
+# Windows startup (HKCU registry — no admin rights required)
+# ---------------------------------------------------------------------------
+_STARTUP_REG_KEY  = r"Software\Microsoft\Windows\CurrentVersion\Run"
+_STARTUP_REG_NAME = "lg-input-switch"
+
+
+def _get_startup() -> bool:
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _STARTUP_REG_KEY) as key:
+            winreg.QueryValueEx(key, _STARTUP_REG_NAME)
+            return True
+    except FileNotFoundError:
+        return False
+
+
+def _set_startup(enabled: bool) -> None:
+    with winreg.OpenKey(
+        winreg.HKEY_CURRENT_USER, _STARTUP_REG_KEY, 0, winreg.KEY_SET_VALUE
+    ) as key:
+        if enabled:
+            winreg.SetValueEx(key, _STARTUP_REG_NAME, 0, winreg.REG_SZ, sys.executable)
+        else:
+            try:
+                winreg.DeleteValue(key, _STARTUP_REG_NAME)
+            except FileNotFoundError:
+                pass
+
+
+def _prompt_startup() -> bool:
+    """Ask whether to enable/disable running at Windows startup.
+    Returns True if ESC was pressed (go back), False otherwise."""
+    currently = _get_startup()
+    action    = "Disable startup" if currently else "Enable startup"
+    options   = [action, "Leave as is"]
+    idx       = 0
+    n_lines   = len(options) + 1   # option rows + hints row
+
+    def render(first: bool = False) -> None:
+        if not first:
+            sys.stdout.write(f"\033[{n_lines}A")
+        for i, label in enumerate(options):
+            if i == idx:
+                line = f"  {_GREEN}>{_RESET} {_CYAN}{_BOLD}{label}{_RESET}"
+            else:
+                line = f"    {_DIM}{label}{_RESET}"
+            sys.stdout.write(f"\033[2K{line}\n")
+        hints = (
+            f"  {_YELLOW}↑ ↓{_RESET}{_DIM} navigate{_RESET}"
+            f"   {_YELLOW}↵{_RESET}{_DIM} select{_RESET}"
+            f"   {_YELLOW}ESC{_RESET}{_DIM} go back{_RESET}"
+        )
+        sys.stdout.write(f"\033[2K{hints}\n")
+        sys.stdout.flush()
+
+    _clear()
+    status = f"{_GREEN}enabled{_RESET}" if currently else f"{_DIM}disabled{_RESET}"
+    print(f"{_BOLD}Start with Windows{_RESET}  (currently {status})\n")
+    print(
+        f"  {_YELLOW}Note:{_RESET}{_DIM} selecting '{action}' will write a value to your"
+        f" Windows registry under{_RESET}"
+    )
+    print(f"  {_DIM}HKCU\\{_STARTUP_REG_KEY}{_RESET}")
+    print(f"  {_DIM}No admin rights required. You can change this at any time by pressing ESC to reconfigure.{_RESET}")
+    print()
+
+    sys.stdout.write("\033[?25l")
+    sys.stdout.flush()
+    render(first=True)
+
+    try:
+        while True:
+            ch = msvcrt.getch()
+            if ch in (b"\xe0", b"\x00"):
+                ch2 = msvcrt.getch()
+                if ch2 == b"H":
+                    idx = (idx - 1) % len(options)
+                    render()
+                elif ch2 == b"P":
+                    idx = (idx + 1) % len(options)
+                    render()
+            elif ch == b"\r":
+                if idx == 0:
+                    _set_startup(not currently)
+                _clear()
+                return False
+            elif ch == b"\x1b":
+                return True   # go back
+    finally:
+        sys.stdout.write("\033[?25h")
+        sys.stdout.flush()
 
 
 def log(msg: str) -> None:
@@ -209,6 +472,278 @@ def _i2c_write(lib: ctypes.CDLL, gpu, masks: list[int], packet: list[int]) -> bo
 
 
 # ---------------------------------------------------------------------------
+# configure / daemon commands
+# ---------------------------------------------------------------------------
+_RESET   = "\033[0m"
+_BOLD    = "\033[1m"
+_DIM     = "\033[2m"
+_RED     = "\033[91m"
+_GREEN   = "\033[92m"
+_YELLOW  = "\033[93m"
+_CYAN    = "\033[96m"
+_MAGENTA = "\033[95m"
+
+
+def _clear() -> None:
+    sys.stdout.write("\033[2J\033[H")
+    sys.stdout.flush()
+
+
+def _fmt_hotkey(raw: str) -> str:
+    return f"{_MAGENTA}{raw}{_RESET}"
+
+
+def _fmt_input(key: str) -> str:
+    return f"{_CYAN}{_BOLD}{key}{_RESET}"
+
+
+def _show_context(ctx: dict) -> None:
+    for label, value in ctx.items():
+        print(f"  {_DIM}{label}:{_RESET} {value}")
+    print()
+
+
+def _pick_input(prompt: str, exclude: str | None = None,
+                ctx: dict | None = None, allow_back: bool = True) -> str | None:
+    """Arrow-key selector. Returns chosen key, or None if ESC pressed."""
+    options = [k for k in INPUTS if k != exclude]
+    idx     = 0
+    n_lines = len(options) + 1   # option rows + hints row
+
+    def render(first: bool = False) -> None:
+        if not first:
+            sys.stdout.write(f"\033[{n_lines}A")
+        for i, key in enumerate(options):
+            label = INPUTS[key][1]
+            if i == idx:
+                line = f"  {_GREEN}>{_RESET} {_CYAN}{_BOLD}{key:<8}{_RESET} {_CYAN}{label}{_RESET}"
+            else:
+                line = f"    {_DIM}{key:<8} {label}{_RESET}"
+            sys.stdout.write(f"\033[2K{line}\n")
+        esc_desc = "exit" if not allow_back else "go back"
+        hints = (
+            f"  {_YELLOW}↑ ↓{_RESET}{_DIM} navigate{_RESET}"
+            f"   {_YELLOW}↵{_RESET}{_DIM} select{_RESET}"
+            f"   {_YELLOW}ESC{_RESET}{_DIM} {esc_desc}{_RESET}"
+        )
+        sys.stdout.write(f"\033[2K{hints}\n")
+        sys.stdout.flush()
+
+    _clear()
+    if ctx:
+        _show_context(ctx)
+    print(f"{_BOLD}{prompt}{_RESET}\n")
+    sys.stdout.write("\033[?25l")
+    sys.stdout.flush()
+    render(first=True)
+
+    try:
+        while True:
+            ch = msvcrt.getch()
+            if ch in (b"\xe0", b"\x00"):
+                ch2 = msvcrt.getch()
+                if ch2 == b"H":
+                    idx = (idx - 1) % len(options)
+                    render()
+                elif ch2 == b"P":
+                    idx = (idx + 1) % len(options)
+                    render()
+            elif ch == b"\r":
+                return options[idx]
+            elif ch == b"\x1b":
+                return None
+    finally:
+        sys.stdout.write("\033[?25h")
+        sys.stdout.flush()
+
+
+def _prompt_hotkey(ctx: dict | None = None, error: str | None = None) -> str | None:
+    """Read a hotkey string character by character. Returns raw string or None if ESC pressed."""
+    _clear()
+    if ctx:
+        _show_context(ctx)
+    _example = "ctrl+shift+d"
+    _tokens  = _example.split("+")
+    _parts   = [f"{_RESET}{_MAGENTA}{t}{_RESET}" for t in _tokens]
+    _listed  = (
+        f"{_DIM}, {_RESET}".join(_parts[:-1]) + f"{_DIM} and {_RESET}" + _parts[-1]
+    )
+    print(f"{_BOLD}Hotkey — type it as text, e.g. {_fmt_hotkey(_example)}{_BOLD}:{_RESET}")
+    print(f"  {_DIM}the toggle will trigger when you press {_RESET}{_listed}{_DIM} together{_RESET}")
+    hints = (
+        f"  {_YELLOW}↵{_RESET}{_DIM} confirm{_RESET}"
+        f"   {_YELLOW}ESC{_RESET}{_DIM} go back{_RESET}"
+    )
+    print(hints)
+    if error:
+        print(f"\n  {_YELLOW}{error}{_RESET}")
+    sys.stdout.write(f"\n  {_MAGENTA}")
+    sys.stdout.flush()
+
+    chars: list[str] = []
+    try:
+        while True:
+            ch = msvcrt.getch()
+            if ch == b"\x1b":
+                return None
+            elif ch == b"\r":
+                sys.stdout.write(_RESET + "\n")
+                sys.stdout.flush()
+                return "".join(chars)
+            elif ch in (b"\xe0", b"\x00"):
+                msvcrt.getch()  # discard arrow key second byte
+            elif ch == b"\x08":  # backspace
+                if chars:
+                    chars.pop()
+                    sys.stdout.write("\b \b")
+                    sys.stdout.flush()
+            elif 0x20 <= ch[0] <= 0x7E:
+                c = ch.decode("latin-1")
+                chars.append(c)
+                sys.stdout.write(c)
+                sys.stdout.flush()
+    finally:
+        sys.stdout.write(_RESET)
+        sys.stdout.flush()
+
+
+def cmd_configure() -> None:
+    """Interactive setup — writes config.json."""
+    current      = None
+    target       = None
+    step         = 0
+    hotkey_error = None
+
+    while True:
+        if step == 0:
+            result = _pick_input("Which input are you currently on?", allow_back=False)
+            if result is None:   # ESC on first step = exit
+                _clear()
+                print("Exiting setup.")
+                sys.exit(0)
+            current      = result
+            hotkey_error = None
+            step         = 1
+
+        elif step == 1:
+            result = _pick_input(
+                "Which input do you want to toggle to?",
+                exclude=current,
+                ctx={"Currently on": _fmt_input(current)},
+            )
+            if result is None:   # ESC = go back
+                step = 0
+            else:
+                target       = result
+                hotkey_error = None
+                step         = 2
+
+        elif step == 2:
+            result = _prompt_hotkey(
+                ctx={
+                    "Currently on": _fmt_input(current),
+                    "Toggles to":   _fmt_input(target),
+                },
+                error=hotkey_error,
+            )
+            if result is None:   # ESC = go back
+                hotkey_error = None
+                step         = 1
+                continue
+            raw = result.strip()
+            if not raw:
+                hotkey_error = "Hotkey cannot be empty."
+                continue
+            try:
+                parse_hotkey(raw)
+                break
+            except ValueError as exc:
+                hotkey_error = str(exc)
+
+    cfg = {"hotkey": raw, "inputs": [current, target], "last_input": current}
+    _save_config(cfg)
+    _clear()
+    print(f"  {_DIM}hotkey :{_RESET} {_fmt_hotkey(raw)}")
+    print(f"  {_DIM}toggle :{_RESET} {_fmt_input(current)} {_DIM}↔{_RESET} {_fmt_input(target)}")
+    print()
+
+
+def cmd_daemon() -> None:
+    """Listen for the configured hotkey and toggle between two inputs."""
+    cfg      = _load_config()
+    mods, vk = parse_hotkey(cfg["hotkey"])
+    inputs   = cfg["inputs"]
+
+    lib        = _load_nvapi()
+    gpu, masks = _nvapi_setup(lib)
+
+    user32    = ctypes.WinDLL("user32")
+    WM_HOTKEY = 0x0312
+    HOTKEY_ID = 1
+
+    if not user32.RegisterHotKey(None, HOTKEY_ID, mods | MOD_NOREPEAT, vk):
+        sys.exit(
+            f"error: RegisterHotKey failed for '{cfg['hotkey']}' "
+            "(already in use by another application?)"
+        )
+
+    print(f"Listening for {_fmt_hotkey(cfg['hotkey'])}")
+    print(
+        f"  will toggle between:"
+        f" {_fmt_input(inputs[0])} {_DIM}↔{_RESET} {_fmt_input(inputs[1])}"
+    )
+    print()
+    print(
+        f"  {_RED}Ctrl+C{_RESET}{_DIM} exit{_RESET}"
+        f"   {_YELLOW}ESC{_RESET}{_DIM} reconfigure{_RESET}"
+    )
+
+    PM_REMOVE  = 0x0001
+    reconfigure = False
+    msg = ctypes.wintypes.MSG()
+    try:
+        while True:
+            # PeekMessageW + sleep instead of blocking GetMessageW so that
+            # Ctrl+C (SIGINT) can be delivered between iterations.
+            if not user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, PM_REMOVE):
+                if msvcrt.kbhit():
+                    ch = msvcrt.getch()
+                    if ch == b"\x1b":
+                        reconfigure = True
+                        break
+                else:
+                    time.sleep(0.05)
+                continue
+            if msg.message == 0x0012:  # WM_QUIT
+                break
+            if msg.message != WM_HOTKEY:
+                continue
+
+            last   = cfg.get("last_input")
+            target = inputs[1] if last == inputs[0] else inputs[0]
+
+            value, label = INPUTS[target]
+            packet = _build_setvcp(VCP_CODE, value)
+            log(f"[debug] packet: {[f'0x{b:02X}' for b in packet]}")
+
+            if _i2c_write(lib, gpu, masks, packet):
+                print(f"switched to {_fmt_input(target)} {_DIM}({label}){_RESET}")
+                cfg["last_input"] = target
+                _save_config(cfg)
+            else:
+                print(
+                    f"{_YELLOW}error: failed to switch to {label}"
+                    f" — run with --verbose for details{_RESET}"
+                )
+    except KeyboardInterrupt:
+        print(f"\n{_RED}exiting{_RESET}")
+    finally:
+        user32.UnregisterHotKey(None, HOTKEY_ID)
+
+    return reconfigure
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 def _build_parser() -> argparse.ArgumentParser:
@@ -222,20 +757,27 @@ def _build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="\n".join([
             "inputs:",
-            *[f"  {k:<8} {desc}" for k, (_, desc) in INPUTS.items()],
+            *[f"  {k:<12} {desc}" for k, (_, desc) in INPUTS.items()],
+            "",
+            "commands:",
+            "  scan         verify monitor is detected on I2C bus",
+            "  configure    interactive setup: choose two inputs and a hotkey",
+            "  daemon       listen for configured hotkey and toggle inputs",
             "",
             "examples:",
             "  lg-switch dp",
             "  lg-switch usbc",
             "  lg-switch --verbose hdmi1",
             "  lg-switch scan",
+            "  lg-switch configure",
+            "  lg-switch daemon",
         ]),
     )
     parser.add_argument(
         "input",
-        choices=[*INPUTS.keys(), "scan"],
+        choices=[*INPUTS.keys(), "scan", "configure", "daemon"],
         metavar="input",
-        help=f"target input: {{{', '.join(INPUTS)}, scan}}",
+        help=f"target input or command: {{{', '.join(INPUTS)}, scan, configure, daemon}}",
     )
     parser.add_argument(
         "-v", "--verbose",
@@ -251,6 +793,14 @@ def main() -> None:
     parser = _build_parser()
     args   = parser.parse_args()
     _verbose = args.verbose
+
+    if args.input == "configure":
+        cmd_configure()
+        return
+
+    if args.input == "daemon":
+        cmd_daemon()
+        return
 
     lib        = _load_nvapi()
     gpu, masks = _nvapi_setup(lib)

@@ -11,26 +11,64 @@ The fix is to bypass the Windows DDC/CI stack entirely and write the raw I2C pac
 ## Requirements
 
 - Windows 10/11
-- Python 3.10+
 - NVIDIA GPU with up-to-date drivers (RTX series confirmed working)
 - LG 45GX950A-B connected via DisplayPort or HDMI (USB-C confirmed working too)
 
-No third-party Python packages required — only the standard library.
-
 ## Installation
+
+### Option A — pre-built executables (no Python required)
+
+1. Go to the [Releases](https://github.com/meer-cha/lg-input-switch/releases) page and download the `.zip` from the latest release
+2. Create a new folder anywhere (e.g. `C:\Users\You\LG Input Switch`)
+3. Extract the contents of the zip into that folder
+4. Run `lg-input-switch.exe` — it will guide you through setup on the first run, then start listening for your hotkey
+
+### Option B — run from source
+
+Requires Python 3.10+. No third-party packages needed.
 
 ```
 git clone https://github.com/meer-cha/lg-input-switch.git
 cd lg-input-switch
+python lg_switch.py configure
+python lg_switch.py daemon
 ```
+
+### Option C — build the executables yourself
+
+Requires Python 3.10+ and pip.
+
+```
+git clone https://github.com/meer-cha/lg-input-switch.git
+cd lg-input-switch
+build.bat
+```
+
+The executables will be in the `dist\` folder.
 
 ## Usage
 
+### Standalone executable
+
 ```
-python lg_switch.py <input> [-v]
+lg-input-switch.exe
 ```
 
-### Inputs
+On the first run it will walk you through choosing your two inputs and hotkey, then immediately start listening. On every subsequent run it goes straight to listening.
+
+- Press `ESC` at any time to reconfigure your inputs or hotkey — you'll also be offered the option to enable or disable running at Windows startup
+- Press `Ctrl+C` to exit
+- The last active input is remembered so it always picks up where it left off
+
+> **Windows startup:** after setup you'll be asked whether to start automatically with Windows. This writes a single value to `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` — no admin rights required. You can enable or disable it at any time by pressing `ESC` to reconfigure and navigating back to the startup screen.
+
+### From source
+
+```
+python lg_switch.py <input|command> [-v]
+```
+
+#### Inputs
 
 | Argument | Input |
 |----------|-------|
@@ -40,21 +78,48 @@ python lg_switch.py <input> [-v]
 | `usbc`   | USB-C / Thunderbolt |
 | `scan`   | Detect connected outputs (no switch) |
 
-### Options
+#### Options
 
 | Flag | Description |
 |------|-------------|
 | `-v`, `--verbose` | Print NVAPI debug info and per-attempt I2C results |
 | `-h`, `--help`    | Show help and exit |
 
-### Examples
+#### Examples
 
 ```
 python lg_switch.py dp
 python lg_switch.py usbc
 python lg_switch.py --verbose hdmi1
 python lg_switch.py scan
+python lg_switch.py configure
+python lg_switch.py daemon
 ```
+
+### Hotkey format
+
+Type the hotkey as `+`-separated tokens — do **not** press the keys, type the names:
+
+| Token type | Examples |
+|------------|---------|
+| Modifiers  | `ctrl`, `shift`, `alt`, `win` |
+| Letters    | `a`–`z` |
+| Digits     | `0`–`9` |
+| F-keys     | `f1`–`f12` |
+| Navigation | `insert`, `delete`, `home`, `end`, `pageup`, `pagedown`, `left`, `right`, `up`, `down` |
+| Numpad digits | `numpad0`–`numpad9` |
+| Numpad operators | `numpad+`, `numpad-`, `numpad*`, `numpad/`, `numpad.` |
+| Symbols    | `;` `:` `=` `,` `-` `_` `.` `/` `` ` `` `[` `]` `\` `'` and their shifted variants |
+| Space/Enter/Esc/Tab | `space`, `enter`, `esc`, `tab` |
+
+Examples: `ctrl+shift+d`, `alt+f1`, `ctrl+numpad1`, `ctrl+shift+;`
+
+#### Hotkey restrictions
+
+- At least one modifier (`ctrl`, `shift`, `alt`, or `win`) is required — except F-keys (`f1`–`f12`) which may be used alone
+- `shift` alone with a typeable character is blocked (e.g. `shift+/` just types `?`)
+- The following are reserved and cannot be used: `esc` (reconfigure), `ctrl+c` (exit)
+- Common Windows shortcuts are blocked: `ctrl+v`, `ctrl+x`, `ctrl+z`, `ctrl+a`, `ctrl+s`
 
 ## How it works
 
@@ -85,6 +150,10 @@ The LG also uses a **proprietary VCP code `0xF4`** for input selection rather th
 **`nvapi64.dll` not found** — NVIDIA drivers are not installed or not on the system PATH.
 
 **All attempts fail with `err -1`** — run `python lg_switch.py scan` and check the output mask. If it returns `0x00000000`, the GPU is not detecting the monitor on its I2C bus (try a different cable or port). Run with `--verbose` to see per-attempt results.
+
+**Daemon hotkey does nothing** — another application may have registered the same hotkey. Try a different combination.
+
+**Want to change inputs or hotkey** — press `ESC` while the daemon is running to reconfigure.
 
 ## Credits
 
