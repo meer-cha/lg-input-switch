@@ -443,6 +443,7 @@ def _i2c_write(lib: ctypes.CDLL, gpu, masks: list[int], packet: list[int]) -> bo
     )(_resolve(lib, 0xE812EB07))
 
     data_buf = (ctypes.c_uint8 * len(packet))(*packet)
+    success = False
 
     for mask in masks:
         for port_id, port_set in [(0, 0), (1, 1), (2, 1), (3, 1),
@@ -466,9 +467,9 @@ def _i2c_write(lib: ctypes.CDLL, gpu, masks: list[int], packet: list[int]) -> bo
                 f"{'OK' if ret == NVAPI_OK else f'err {ret}'}")
 
             if ret == NVAPI_OK:
-                return True
+                success = True
 
-    return False
+    return success
 
 
 # ---------------------------------------------------------------------------
