@@ -21,9 +21,11 @@ The fix is to bypass the Windows DDC/CI stack entirely and write the raw I2C pac
 1. Go to the [Releases](https://github.com/meer-cha/lg-input-switch/releases) page and download the `.zip` from the latest release (not the "Source code (zip)")
 2. Create a new folder anywhere (e.g. `C:\Users\You\LG Input Switch`)
 3. Extract the contents of the zip into that folder
-4. Run `lg-input-switch.exe` — it will guide you through setup on the first run, then start listening for your hotkey
+4. Run `lg-input-switch.exe` — it will guide you through setup on the first run, then hide seamlessly into your system tray and start listening for your hotkey.
 
-> **Keep the window open.** The hotkey only works while the console window is running. You can minimize it — but closing it stops the hotkey listener. Minimizing to the system tray is not supported.
+**System Tray:** The executable runs entirely in the background. Look for the `LG Input Switch` icon in your Windows System Tray to configure your hotkeys, exit the app, or toggle "Start with Windows".
+
+![tray-example.png](tray-example.png)
 
 ### Option B — run from source
 
@@ -56,17 +58,12 @@ The executables will be in the `dist\` folder.
 lg-input-switch.exe
 ```
 
-On the first run it will walk you through choosing your two inputs and hotkey, then immediately start listening. On every subsequent run it goes straight to listening.
+On the first run it will allocate a temporary console to walk you through choosing your two inputs and hotkey, then immediately vanish into your System Tray and start listening. On every subsequent run it goes straight to the System Tray.
 
-- Press `ESC` at any time to reconfigure your inputs or hotkey — you'll also be offered the option to enable or disable running at Windows startup
-- Press `Ctrl+C` to exit
-- The last active input is remembered so it always picks up where it left off
-
-> **Windows startup:** after setup you'll be asked whether to start automatically with Windows. This writes a single value to `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` — no admin rights required. You can enable or disable it at any time by pressing `ESC` to reconfigure and navigating back to the startup screen.
->
-> **Note:** Windows startup has not been fully tested — my machine has unrelated issues with startup apps, so this feature may or may not work on your system.
-
-> **Console window:** the hotkey listener only works while the console window is running — you can minimize it, but closing it stops the listener. Minimizing to the system tray is not supported.
+- **Configure:** Right click the tray icon and select **Configure** to rebind your inputs or hotkey at any time.
+- **Start with Windows:** Right click the tray icon and toggle **Start with Windows** on or off. This writes a single value to `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` — no admin rights required.
+- **Quit:** Right click the tray icon and select **Quit** to exit.
+- The last active input is remembered so it always picks up where it left off!
 
 ### From source
 
@@ -159,7 +156,7 @@ The LG also uses a **proprietary VCP code `0xF4`** for input selection rather th
 
 **Daemon hotkey does nothing** — another application may have registered the same hotkey. Try a different combination.
 
-**Want to change inputs or hotkey** — press `ESC` while the daemon is running to reconfigure.
+**Want to change inputs or hotkey** — Right-click the System Tray icon and select **Configure**.
 
 ## Credits
 

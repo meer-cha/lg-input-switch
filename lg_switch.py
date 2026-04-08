@@ -8,10 +8,15 @@ import ctypes
 import ctypes.wintypes
 import json
 import msvcrt
+import subprocess
 import sys
+import threading
 import time
 import winreg
 from pathlib import Path
+
+import pystray
+from PIL import Image
 
 # ---------------------------------------------------------------------------
 # Input source values (LG-specific, sent via proprietary VCP code 0xF4)
@@ -222,70 +227,6 @@ def _set_startup(enabled: bool) -> None:
                 winreg.DeleteValue(key, _STARTUP_REG_NAME)
             except FileNotFoundError:
                 pass
-
-
-def _prompt_startup() -> bool:
-    """Ask whether to enable/disable running at Windows startup.
-    Returns True if ESC was pressed (go back), False otherwise."""
-    currently = _get_startup()
-    action    = "Disable startup" if currently else "Enable startup"
-    options   = [action, "Leave as is"]
-    idx       = 0
-    n_lines   = len(options) + 1   # option rows + hints row
-
-    def render(first: bool = False) -> None:
-        if not first:
-            sys.stdout.write(f"\033[{n_lines}A")
-        for i, label in enumerate(options):
-            if i == idx:
-                line = f"  {_GREEN}>{_RESET} {_CYAN}{_BOLD}{label}{_RESET}"
-            else:
-                line = f"    {_DIM}{label}{_RESET}"
-            sys.stdout.write(f"\033[2K{line}\n")
-        hints = (
-            f"  {_YELLOW}↑ ↓{_RESET}{_DIM} navigate{_RESET}"
-            f"   {_YELLOW}↵{_RESET}{_DIM} select{_RESET}"
-            f"   {_YELLOW}ESC{_RESET}{_DIM} go back{_RESET}"
-        )
-        sys.stdout.write(f"\033[2K{hints}\n")
-        sys.stdout.flush()
-
-    _clear()
-    status = f"{_GREEN}enabled{_RESET}" if currently else f"{_DIM}disabled{_RESET}"
-    print(f"{_BOLD}Start with Windows{_RESET}  (currently {status})\n")
-    print(
-        f"  {_YELLOW}Note:{_RESET}{_DIM} selecting '{action}' will write a value to your"
-        f" Windows registry under{_RESET}"
-    )
-    print(f"  {_DIM}HKCU\\{_STARTUP_REG_KEY}{_RESET}")
-    print(f"  {_DIM}No admin rights required. You can change this at any time by pressing ESC to reconfigure.{_RESET}")
-    print()
-
-    sys.stdout.write("\033[?25l")
-    sys.stdout.flush()
-    render(first=True)
-
-    try:
-        while True:
-            ch = msvcrt.getch()
-            if ch in (b"\xe0", b"\x00"):
-                ch2 = msvcrt.getch()
-                if ch2 == b"H":
-                    idx = (idx - 1) % len(options)
-                    render()
-                elif ch2 == b"P":
-                    idx = (idx + 1) % len(options)
-                    render()
-            elif ch == b"\r":
-                if idx == 0:
-                    _set_startup(not currently)
-                _clear()
-                return False
-            elif ch == b"\x1b":
-                return True   # go back
-    finally:
-        sys.stdout.write("\033[?25h")
-        sys.stdout.flush()
 
 
 def log(msg: str) -> None:
@@ -669,53 +610,44 @@ def cmd_configure() -> None:
     print()
 
 
+def _create_icon_image() -> Image.Image:
+    """Load the icon.png file from disk or PyInstaller bundle."""
+    exe_dir = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).parent
+    icon_path = exe_dir / "icon.png"
+    if icon_path.exists():
+        return Image.open(icon_path).convert("RGBA")
+    if getattr(sys, "frozen", False):
+        return Image.open(Path(sys._MEIPASS) / "icon.png").convert("RGBA")
+    return Image.open(icon_path).convert("RGBA")
+
+
 def cmd_daemon() -> None:
-    """Listen for the configured hotkey and toggle between two inputs."""
+    """Listen for the configured hotkey and operate from the system tray."""
     cfg      = _load_config()
     mods, vk = parse_hotkey(cfg["hotkey"])
     inputs   = cfg["inputs"]
 
-    lib        = _load_nvapi()
-    gpu, masks = _nvapi_setup(lib)
+    _stop_event = threading.Event()
 
-    user32    = ctypes.WinDLL("user32")
-    WM_HOTKEY = 0x0312
-    HOTKEY_ID = 1
+    def hotkey_listener():
+        lib        = _load_nvapi()
+        gpu, masks = _nvapi_setup(lib)
 
-    if not user32.RegisterHotKey(None, HOTKEY_ID, mods | MOD_NOREPEAT, vk):
-        sys.exit(
-            f"error: RegisterHotKey failed for '{cfg['hotkey']}' "
-            "(already in use by another application?)"
-        )
+        user32    = ctypes.WinDLL("user32")
+        WM_HOTKEY = 0x0312
+        HOTKEY_ID = 1
 
-    print(f"Listening for {_fmt_hotkey(cfg['hotkey'])}")
-    print(
-        f"  will toggle between:"
-        f" {_fmt_input(inputs[0])} {_DIM}↔{_RESET} {_fmt_input(inputs[1])}"
-    )
-    print()
-    print(
-        f"  {_RED}Ctrl+C{_RESET}{_DIM} exit{_RESET}"
-        f"   {_YELLOW}ESC{_RESET}{_DIM} reconfigure{_RESET}"
-    )
-    print()
-    print(f"  {_YELLOW}Keep this window open{_RESET}{_DIM} (minimized is fine) — closing it stops the hotkey.{_RESET}")
+        if not user32.RegisterHotKey(None, HOTKEY_ID, mods | MOD_NOREPEAT, vk):
+            print(f"error: RegisterHotKey failed for '{cfg['hotkey']}'")
+            import os
+            os._exit(1)
 
-    PM_REMOVE  = 0x0001
-    reconfigure = False
-    msg = ctypes.wintypes.MSG()
-    try:
-        while True:
-            # PeekMessageW + sleep instead of blocking GetMessageW so that
-            # Ctrl+C (SIGINT) can be delivered between iterations.
+        PM_REMOVE = 0x0001
+        msg = ctypes.wintypes.MSG()
+
+        while not _stop_event.is_set():
             if not user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, PM_REMOVE):
-                if msvcrt.kbhit():
-                    ch = msvcrt.getch()
-                    if ch == b"\x1b":
-                        reconfigure = True
-                        break
-                else:
-                    time.sleep(0.05)
+                time.sleep(0.05)
                 continue
             if msg.message == 0x0012:  # WM_QUIT
                 break
@@ -730,20 +662,51 @@ def cmd_daemon() -> None:
             log(f"[debug] packet: {[f'0x{b:02X}' for b in packet]}")
 
             if _i2c_write(lib, gpu, masks, packet):
-                print(f"switched to {_fmt_input(target)} {_DIM}({label}){_RESET}")
+                log(f"[info] switched to {target} ({label})")
                 cfg["last_input"] = target
                 _save_config(cfg)
             else:
-                print(
-                    f"{_YELLOW}error: failed to switch to {label}"
-                    f" — run with --verbose for details{_RESET}"
-                )
-    except KeyboardInterrupt:
-        print(f"\n{_RED}exiting{_RESET}")
-    finally:
+                log(f"[error] failed to switch to {label}")
+
         user32.UnregisterHotKey(None, HOTKEY_ID)
 
-    return reconfigure
+    t = threading.Thread(target=hotkey_listener, daemon=True)
+    t.start()
+
+    def on_quit(icon, item):
+        _stop_event.set()
+        icon.stop()
+
+    def on_configure(icon, item):
+        # Fire up a new command prompt to run the configure wizard
+        if getattr(sys, "frozen", False):
+            args = [sys.executable, "configure"]
+        else:
+            py_exe = str(Path(sys.executable).with_name("python.exe"))
+            args = [py_exe, __file__, "configure"]
+        
+        subprocess.Popen(args, creationflags=subprocess.CREATE_NEW_CONSOLE)
+
+    icon = pystray.Icon(
+        "lg-switch", 
+        _create_icon_image(), 
+        "LG Input Switch\nHotkey active", 
+        menu=pystray.Menu(
+            pystray.MenuItem(
+                "Start with Windows",
+                lambda icon, item: _set_startup(not _get_startup()),
+                checked=lambda item: _get_startup()
+            ),
+            pystray.MenuItem("Configure", on_configure),
+            pystray.MenuItem("Quit", on_quit)
+        )
+    )
+
+    print(f"Running as daemon in system tray. Listening for {cfg['hotkey']}...")
+    try:
+        icon.run()
+    except KeyboardInterrupt:
+        on_quit(icon, None)
 
 
 # ---------------------------------------------------------------------------
