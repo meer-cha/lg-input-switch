@@ -46,11 +46,22 @@ def main() -> None:
             cmd_configure()
             _clear()
             print("Setup complete! The tool is now hiding in your System Tray.\n")
+            import time
+            for i in range(5, 0, -1):
+                sys.stdout.write(f"\rThis window will close in {i}s...  ")
+                sys.stdout.flush()
+                time.sleep(1)
             valid = True
 
-        # If we had allocated a console for setup, we can detach/free it now so the daemon runs silently.
-        if ctypes.windll.kernel32.GetConsoleWindow() != 0:
+        # If we had allocated a console for setup, hide and free it so the daemon runs silently.
+        hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+        if hwnd:
+            ctypes.windll.user32.ShowWindow(hwnd, 0)  # SW_HIDE
             ctypes.windll.kernel32.FreeConsole()
+            import os
+            devnull = open(os.devnull, "w")
+            sys.stdout = devnull
+            sys.stderr = devnull
 
         cmd_daemon()
         break

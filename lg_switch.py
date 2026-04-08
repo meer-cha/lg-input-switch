@@ -465,7 +465,7 @@ def _pick_input(prompt: str, exclude: str | None = None,
         esc_desc = "exit" if not allow_back else "go back"
         hints = (
             f"  {_YELLOW}↑ ↓{_RESET}{_DIM} navigate{_RESET}"
-            f"   {_YELLOW}↵{_RESET}{_DIM} select{_RESET}"
+            f"   {_YELLOW}Enter{_RESET}{_DIM} select{_RESET}"
             f"   {_YELLOW}ESC{_RESET}{_DIM} {esc_desc}{_RESET}"
         )
         sys.stdout.write(f"\033[2K{hints}\n")
@@ -513,7 +513,7 @@ def _prompt_hotkey(ctx: dict | None = None, error: str | None = None) -> str | N
     print(f"{_BOLD}Hotkey — type it as text, e.g. {_fmt_hotkey(_example)}{_BOLD}:{_RESET}")
     print(f"  {_DIM}the toggle will trigger when you press {_RESET}{_listed}{_DIM} together{_RESET}")
     hints = (
-        f"  {_YELLOW}↵{_RESET}{_DIM} confirm{_RESET}"
+        f"  {_YELLOW}Enter{_RESET}{_DIM} confirm{_RESET}"
         f"   {_YELLOW}ESC{_RESET}{_DIM} go back{_RESET}"
     )
     print(hints)
@@ -553,6 +553,7 @@ def cmd_configure() -> None:
     """Interactive setup — writes config.json."""
     current      = None
     target       = None
+    raw          = None
     step         = 0
     hotkey_error = None
 
@@ -598,9 +599,67 @@ def cmd_configure() -> None:
                 continue
             try:
                 parse_hotkey(raw)
-                break
+                step = 3
             except ValueError as exc:
                 hotkey_error = str(exc)
+
+        elif step == 3:
+            yn_options = ["Yes", "No"]
+            yn_idx     = 0 if _get_startup() else 1
+            n_lines    = len(yn_options) + 1
+
+            def render_yn(first: bool = False) -> None:
+                if not first:
+                    sys.stdout.write(f"\033[{n_lines}A")
+                for i, opt in enumerate(yn_options):
+                    if i == yn_idx:
+                        line = f"  {_GREEN}>{_RESET} {_CYAN}{_BOLD}{opt}{_RESET}"
+                    else:
+                        line = f"    {_DIM}{opt}{_RESET}"
+                    sys.stdout.write(f"\033[2K{line}\n")
+                hints = (
+                    f"  {_YELLOW}↑ ↓{_RESET}{_DIM} navigate{_RESET}"
+                    f"   {_YELLOW}Enter{_RESET}{_DIM} select{_RESET}"
+                    f"   {_YELLOW}ESC{_RESET}{_DIM} go back{_RESET}"
+                )
+                sys.stdout.write(f"\033[2K{hints}\n")
+                sys.stdout.flush()
+
+            _clear()
+            _show_context({
+                "Currently on": _fmt_input(current),
+                "Toggles to":   _fmt_input(target),
+                "Hotkey":        _fmt_hotkey(raw),
+            })
+            print(f"{_BOLD}Start with Windows?{_RESET}\n")
+            sys.stdout.write("\033[?25l")
+            sys.stdout.flush()
+            render_yn(first=True)
+
+            try:
+                while True:
+                    ch = msvcrt.getch()
+                    if ch in (b"\xe0", b"\x00"):
+                        ch2 = msvcrt.getch()
+                        if ch2 == b"H":
+                            yn_idx = (yn_idx - 1) % len(yn_options)
+                            render_yn()
+                        elif ch2 == b"P":
+                            yn_idx = (yn_idx + 1) % len(yn_options)
+                            render_yn()
+                    elif ch == b"\r":
+                        _set_startup(yn_idx == 0)
+                        break
+                    elif ch == b"\x1b":
+                        step = 2
+                        break
+            finally:
+                sys.stdout.write("\033[?25h")
+                sys.stdout.flush()
+
+            if step == 2:
+                continue
+            break
 
     cfg = {"hotkey": raw, "inputs": [current, target], "last_input": current}
     _save_config(cfg)

@@ -58,7 +58,7 @@ The executables will be in the `dist\` folder.
 lg-input-switch.exe
 ```
 
-On the first run it will allocate a temporary console to walk you through choosing your two inputs and hotkey, then immediately vanish into your System Tray and start listening. On every subsequent run it goes straight to the System Tray.
+On the first run it will allocate a temporary console to walk you through choosing your two inputs, hotkey, and whether to start with Windows — then immediately vanish into your System Tray and start listening. On every subsequent run it goes straight to the System Tray.
 
 - **Configure:** Right click the tray icon and select **Configure** to rebind your inputs or hotkey at any time.
 - **Start with Windows:** Right click the tray icon and toggle **Start with Windows** on or off. This writes a single value to `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` — no admin rights required.
