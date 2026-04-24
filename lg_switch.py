@@ -8,6 +8,7 @@ import ctypes
 import ctypes.wintypes
 import json
 import msvcrt
+import os
 import subprocess
 import sys
 import threading
@@ -28,16 +29,48 @@ INPUTS = {
     "usbc":  (0xD1, "USB-C / Thunderbolt"),
 }
 
-VCP_CODE        = 0xF4    # LG proprietary input-select code
+PBP_MODES = {
+    "off":     (0x01, "PBP off"),
+    "none":    (0x01, "PBP off"),
+    "50-50":   (0x05, "PBP 50/50"),
+    "split":   (0x05, "PBP 50/50"),
+    "66-33":   (0x03, "PBP 66/33 (experimental)"),
+    "unknown2": (0x02, "PBP mode 0x02 (experimental)"),
+}
+
+INPUT_SOURCE_ADDR = 0x50  # LG side channel for input switching
+PBP_SOURCE_ADDR   = 0x51  # LG side channel for PBP controls
+INPUT_VCP_CODE    = 0xF4  # LG proprietary input-select code
+PBP_VCP_CODE      = 0xD7  # LG proprietary PBP mode code
 DDC_DEVICE_ADDR = 0x6E    # 0x37 << 1  (DDC/CI destination address)
 NVAPI_OK        = 0
 NVAPI_MAX_GPUS  = 64
 
-CONFIG_PATH = (
-    Path(sys.executable).parent / "config.json"
-    if getattr(sys, "frozen", False)          # running as PyInstaller .exe
-    else Path(__file__).parent / "config.json"
-)
+def _get_config_path() -> Path:
+    """Return a writable per-user config path, migrating legacy exe-local config."""
+    if not getattr(sys, "frozen", False):
+        return Path(__file__).parent / "config.json"
+
+    appdata_root = Path(
+        os.environ.get("LOCALAPPDATA")
+        or os.environ.get("APPDATA")
+        or str(Path.home() / "AppData" / "Local")
+    )
+    config_dir = appdata_root / "LG Input Switch"
+    config_path = config_dir / "config.json"
+
+    legacy_path = Path(sys.executable).parent / "config.json"
+    if legacy_path.exists() and not config_path.exists():
+        try:
+            config_dir.mkdir(parents=True, exist_ok=True)
+            config_path.write_text(legacy_path.read_text())
+        except OSError:
+            pass
+
+    return config_path
+
+
+CONFIG_PATH = _get_config_path()
 
 _verbose = False
 
@@ -197,6 +230,7 @@ def _load_config() -> dict:
 
 
 def _save_config(cfg: dict) -> None:
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
     CONFIG_PATH.write_text(json.dumps(cfg, indent=2) + "\n")
 
 
@@ -245,10 +279,10 @@ def log(msg: str) -> None:
 # Packet layout:  [src_addr, length, opcode, vcp_code, value_hi, value_lo, checksum]
 # Checksum:       XOR of DDC_DEVICE_ADDR and all preceding payload bytes.
 # ---------------------------------------------------------------------------
-def _build_setvcp(vcp_code: int, value: int) -> list[int]:
+def _build_setvcp(source_addr: int, vcp_code: int, value: int) -> list[int]:
     vh  = (value >> 8) & 0xFF
     vl  = value & 0xFF
-    pkt = [0x50, 0x84, 0x03, vcp_code, vh, vl]
+    pkt = [source_addr, 0x84, 0x03, vcp_code, vh, vl]
     checksum = DDC_DEVICE_ADDR
     for b in pkt:
         checksum ^= b
@@ -411,6 +445,44 @@ def _i2c_write(lib: ctypes.CDLL, gpu, masks: list[int], packet: list[int]) -> bo
                 success = True
 
     return success
+
+
+def _parse_int_arg(raw: str, name: str, min_value: int, max_value: int) -> int:
+    """Parse decimal or 0x-prefixed CLI integers with a clear range error."""
+    try:
+        value = int(raw, 0)
+    except ValueError:
+        sys.exit(f"error: {name} must be a decimal or hex value, got '{raw}'")
+    if not min_value <= value <= max_value:
+        sys.exit(
+            f"error: {name} must be between 0x{min_value:X} and 0x{max_value:X}, "
+            f"got 0x{value:X}"
+        )
+    return value
+
+
+def _send_setvcp(source_addr: int, vcp_code: int, value: int, label: str | None = None) -> bool:
+    lib        = _load_nvapi()
+    gpu, masks = _nvapi_setup(lib)
+    packet     = _build_setvcp(source_addr, vcp_code, value)
+    log(f"[debug] packet: {[f'0x{b:02X}' for b in packet]}")
+
+    success = _i2c_write(lib, gpu, masks, packet)
+    if label:
+        if success:
+            print(label)
+        else:
+            sys.exit(f"error: failed to send {label} - run with --verbose for details")
+    return success
+
+
+def _send_pbp_mode(mode: str, quiet: bool = False) -> bool:
+    if mode not in PBP_MODES:
+        valid = ", ".join(PBP_MODES)
+        sys.exit(f"error: unknown PBP mode '{mode}' - choose one of: {valid}")
+    value, label = PBP_MODES[mode]
+    result_label = None if quiet else f"set {label}"
+    return _send_setvcp(PBP_SOURCE_ADDR, PBP_VCP_CODE, value, result_label)
 
 
 # ---------------------------------------------------------------------------
@@ -717,7 +789,7 @@ def cmd_daemon() -> None:
             target = inputs[1] if last == inputs[0] else inputs[0]
 
             value, label = INPUTS[target]
-            packet = _build_setvcp(VCP_CODE, value)
+            packet = _build_setvcp(INPUT_SOURCE_ADDR, INPUT_VCP_CODE, value)
             log(f"[debug] packet: {[f'0x{b:02X}' for b in packet]}")
 
             if _i2c_write(lib, gpu, masks, packet):
@@ -746,11 +818,22 @@ def cmd_daemon() -> None:
         
         subprocess.Popen(args, creationflags=subprocess.CREATE_NEW_CONSOLE)
 
+    def on_pbp_mode(mode: str):
+        threading.Thread(target=lambda: _send_pbp_mode(mode, quiet=True), daemon=True).start()
+
     icon = pystray.Icon(
         "lg-switch", 
         _create_icon_image(), 
         "LG Input Switch\nHotkey active", 
         menu=pystray.Menu(
+            pystray.MenuItem(
+                "PBP",
+                pystray.Menu(
+                    pystray.MenuItem("Off", lambda icon, item: on_pbp_mode("off")),
+                    pystray.MenuItem("50/50", lambda icon, item: on_pbp_mode("50-50")),
+                    pystray.MenuItem("66/33 (experimental)", lambda icon, item: on_pbp_mode("66-33")),
+                )
+            ),
             pystray.MenuItem(
                 "Start with Windows",
                 lambda icon, item: _set_startup(not _get_startup()),
@@ -775,7 +858,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="lg-switch",
         description=(
-            "Switch the active input on an LG 45GX950A-B monitor.\n\n"
+            "Switch inputs and PBP modes on an LG 45GX950A-B monitor.\n\n"
             "Uses NVAPI raw I2C to send DDC/CI commands with source address 0x50,\n"
             "bypassing the Windows DDC/CI API which the LG silently ignores."
         ),
@@ -784,14 +867,23 @@ def _build_parser() -> argparse.ArgumentParser:
             "inputs:",
             *[f"  {k:<12} {desc}" for k, (_, desc) in INPUTS.items()],
             "",
+            "pbp modes:",
+            *[f"  {k:<12} {desc}" for k, (_, desc) in PBP_MODES.items()],
+            "",
             "commands:",
             "  scan         verify monitor is detected on I2C bus",
             "  configure    interactive setup: choose two inputs and a hotkey",
             "  daemon       listen for configured hotkey and toggle inputs",
+            "  pbp MODE     set Picture-by-Picture mode",
+            "  raw SRC VCP VALUE",
+            "               send an experimental SetVCP command",
             "",
             "examples:",
             "  lg-switch dp",
             "  lg-switch usbc",
+            "  lg-switch pbp off",
+            "  lg-switch pbp 50-50",
+            "  lg-switch raw 0x51 0xD7 0x0005",
             "  lg-switch --verbose hdmi1",
             "  lg-switch scan",
             "  lg-switch configure",
@@ -799,10 +891,13 @@ def _build_parser() -> argparse.ArgumentParser:
         ]),
     )
     parser.add_argument(
-        "input",
-        choices=[*INPUTS.keys(), "scan", "configure", "daemon"],
-        metavar="input",
-        help=f"target input or command: {{{', '.join(INPUTS)}, scan, configure, daemon}}",
+        "command",
+        nargs="+",
+        metavar="command",
+        help=(
+            "input, command, or subcommand; examples: dp, scan, pbp 50-50, "
+            "raw 0x51 0xD7 0x0005"
+        ),
     )
     parser.add_argument(
         "-v", "--verbose",
@@ -818,25 +913,54 @@ def main() -> None:
     parser = _build_parser()
     args   = parser.parse_args()
     _verbose = args.verbose
+    command = args.command
 
-    if args.input == "configure":
+    if len(command) == 1 and command[0] == "configure":
         cmd_configure()
         return
 
-    if args.input == "daemon":
+    if len(command) == 1 and command[0] == "daemon":
         cmd_daemon()
         return
+
+    if command[0] == "pbp":
+        if len(command) != 2:
+            parser.error("pbp requires exactly one mode, e.g. 'pbp off' or 'pbp 50-50'")
+        _send_pbp_mode(command[1])
+        return
+
+    if command[0] == "raw":
+        if len(command) != 4:
+            parser.error("raw requires SRC VCP VALUE, e.g. 'raw 0x51 0xD7 0x0005'")
+        source_addr = _parse_int_arg(command[1], "SRC", 0x00, 0xFF)
+        vcp_code    = _parse_int_arg(command[2], "VCP", 0x00, 0xFF)
+        value       = _parse_int_arg(command[3], "VALUE", 0x0000, 0xFFFF)
+        _send_setvcp(
+            source_addr,
+            vcp_code,
+            value,
+            f"sent raw SetVCP src=0x{source_addr:02X} vcp=0x{vcp_code:02X} value=0x{value:04X}",
+        )
+        return
+
+    if len(command) != 1:
+        parser.error(f"unknown command: {' '.join(command)}")
+
+    target = command[0]
 
     lib        = _load_nvapi()
     gpu, masks = _nvapi_setup(lib)
 
-    if args.input == "scan":
+    if target == "scan":
         print(f"connected output mask: 0x{sum(masks):08X}")
         print(f"output bit(s):         {[hex(m) for m in masks]}")
         return
 
-    value, label = INPUTS[args.input]
-    packet = _build_setvcp(VCP_CODE, value)
+    if target not in INPUTS:
+        parser.error(f"unknown input or command: {target}")
+
+    value, label = INPUTS[target]
+    packet = _build_setvcp(INPUT_SOURCE_ADDR, INPUT_VCP_CODE, value)
     log(f"[debug] packet: {[f'0x{b:02X}' for b in packet]}")
 
     if _i2c_write(lib, gpu, masks, packet):
