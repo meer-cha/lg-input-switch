@@ -2,6 +2,8 @@
 
 Command-line input switcher for the **LG 45GX950A-B** monitor on Windows for nvidia GPUs.
 
+Also includes experimental Picture-by-Picture controls for the same monitor.
+
 ## Background
 
 The LG 45GX950A-B ignores standard DDC/CI input-switching commands sent via the Windows DDC/CI API. The root cause is that LG's firmware requires the DDC/CI source address `0x50` in the I2C packet, while Windows hardcodes `0x51` with no way to override it. Tools like ControlMyMonitor and Twinkle Tray both hit this limitation silently.
@@ -29,11 +31,12 @@ The fix is to bypass the Windows DDC/CI stack entirely and write the raw I2C pac
 
 ### Option B — run from source
 
-Requires Python 3.10+. No third-party packages needed.
+Requires Python 3.10+ and the packages in `requirements.txt`.
 
 ```
 git clone https://github.com/meer-cha/lg-input-switch.git
 cd lg-input-switch
+pip install -r requirements.txt
 python lg_switch.py configure
 python lg_switch.py daemon
 ```
@@ -64,6 +67,7 @@ On the first run it will allocate a temporary console to walk you through choosi
 - **Start with Windows:** Right click the tray icon and toggle **Start with Windows** on or off. This writes a single value to `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` — no admin rights required.
 - **Quit:** Right click the tray icon and select **Quit** to exit.
 - The last active input is remembered so it always picks up where it left off!
+- Settings are stored per-user in `%LOCALAPPDATA%\LG Input Switch\config.json`, so the executable can live in a protected or read-only folder.
 
 ### From source
 
@@ -95,9 +99,50 @@ python lg_switch.py dp
 python lg_switch.py usbc
 python lg_switch.py --verbose hdmi1
 python lg_switch.py scan
+python lg_switch.py pbp 50-50
+python lg_switch.py pbp off
 python lg_switch.py configure
 python lg_switch.py daemon
 ```
+
+#### Picture-by-Picture
+
+The `pbp` command controls LG's Picture-by-Picture side channel.
+
+| Command | Description |
+|---------|-------------|
+| `pbp off` | Turn PBP off |
+| `pbp none` | Turn PBP off |
+| `pbp 50-50` | Turn on 50/50 left-right PBP |
+| `pbp split` | Turn on 50/50 left-right PBP |
+| `pbp 66-33` | Try the reported 66/33 left-right mode (experimental) |
+| `pbp unknown2` | Try the reported mode value `0x02` (experimental) |
+
+Examples:
+
+```
+python lg_switch.py pbp 50-50
+python lg_switch.py pbp off
+python lg_switch.py --verbose pbp 50-50
+```
+
+The system tray menu also includes **PBP > Off**, **PBP > 50/50**, and **PBP > 66/33 (experimental)**.
+
+#### Raw experimental command
+
+For testing LG side-channel values that are not yet named:
+
+```
+python lg_switch.py raw <source_addr> <vcp_code> <value>
+```
+
+Example:
+
+```
+python lg_switch.py raw 0x51 0xD7 0x0005
+```
+
+This sends a raw `SetVCP` packet. Use it carefully; invalid monitor-side commands may do nothing or change OSD settings unexpectedly.
 
 ### Hotkey format
 
@@ -145,6 +190,22 @@ The LG also uses a **proprietary VCP code `0xF4`** for input selection rather th
 | `0x91` | HDMI 2 |
 | `0xD0` | DisplayPort |
 | `0xD1` | USB-C / Thunderbolt |
+
+Picture-by-Picture uses a separate LG side channel:
+
+```
+[src, length, opcode, vcp_code, value_hi, value_lo, checksum]
+ 0x51  0x84    0x03    0xD7      0x00      0x05      <xor>
+```
+
+Known PBP values from the ddcutil LG monitor notes:
+
+| Value | Mode |
+|-------|------|
+| `0x01` | PBP off / none |
+| `0x05` | PBP left-right 50/50 |
+| `0x03` | PBP left-right 66/33 (reported, experimental here) |
+| `0x02` | Reported PBP mode, exact layout unknown |
 
 ## Troubleshooting
 
