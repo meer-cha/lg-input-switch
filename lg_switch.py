@@ -8,6 +8,7 @@ import ctypes
 import ctypes.wintypes
 import json
 import msvcrt
+import os
 import subprocess
 import sys
 import threading
@@ -28,16 +29,47 @@ INPUTS = {
     "usbc":  (0xD1, "USB-C / Thunderbolt"),
 }
 
-VCP_CODE        = 0xF4    # LG proprietary input-select code
+PBP_MODES = {
+    "off":      (0x01, "PBP off"),
+    "none":     (0x01, "PBP off"),
+    "50-50":    (0x05, "PBP 50/50"),
+    "split":    (0x03, "PBP split"),
+    "unknown2": (0x02, "PBP mode 0x02 (experimental)"),
+}
+
+INPUT_SOURCE_ADDR = 0x50  # LG side channel for input switching
+PBP_SOURCE_ADDR   = 0x51  # LG side channel for PBP controls
+INPUT_VCP_CODE    = 0xF4  # LG proprietary input-select code
+PBP_VCP_CODE      = 0xD7  # LG proprietary PBP mode code
 DDC_DEVICE_ADDR = 0x6E    # 0x37 << 1  (DDC/CI destination address)
 NVAPI_OK        = 0
 NVAPI_MAX_GPUS  = 64
 
-CONFIG_PATH = (
-    Path(sys.executable).parent / "config.json"
-    if getattr(sys, "frozen", False)          # running as PyInstaller .exe
-    else Path(__file__).parent / "config.json"
-)
+def _get_config_path() -> Path:
+    """Return a writable per-user config path, migrating legacy exe-local config."""
+    if not getattr(sys, "frozen", False):
+        return Path(__file__).parent / "config.json"
+
+    appdata_root = Path(
+        os.environ.get("LOCALAPPDATA")
+        or os.environ.get("APPDATA")
+        or str(Path.home() / "AppData" / "Local")
+    )
+    config_dir = appdata_root / "LG Input Switch"
+    config_path = config_dir / "config.json"
+
+    legacy_path = Path(sys.executable).parent / "config.json"
+    if legacy_path.exists() and not config_path.exists():
+        try:
+            config_dir.mkdir(parents=True, exist_ok=True)
+            config_path.write_text(legacy_path.read_text())
+        except OSError:
+            pass
+
+    return config_path
+
+
+CONFIG_PATH = _get_config_path()
 
 _verbose = False
 
@@ -180,6 +212,11 @@ def _load_config() -> dict:
     except json.JSONDecodeError as exc:
         sys.exit(f"error: config.json is not valid JSON: {exc}")
 
+    # Migrate old pip_* keys written before the rename to pbp_*
+    for old, new in (("pip_hotkey", "pbp_hotkey"), ("pip_on", "pbp_on")):
+        if old in cfg and new not in cfg:
+            cfg[new] = cfg.pop(old)
+
     for key in ("hotkey", "inputs"):
         if key not in cfg:
             sys.exit(f"error: config.json is missing '{key}' — re-run configure")
@@ -193,10 +230,17 @@ def _load_config() -> dict:
     except ValueError as exc:
         sys.exit(f"error: config.json hotkey invalid: {exc}")
 
+    if cfg.get("pbp_hotkey"):
+        try:
+            parse_hotkey(cfg["pbp_hotkey"])
+        except ValueError as exc:
+            sys.exit(f"error: config.json pbp_hotkey invalid: {exc}")
+
     return cfg
 
 
 def _save_config(cfg: dict) -> None:
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
     CONFIG_PATH.write_text(json.dumps(cfg, indent=2) + "\n")
 
 
@@ -245,10 +289,10 @@ def log(msg: str) -> None:
 # Packet layout:  [src_addr, length, opcode, vcp_code, value_hi, value_lo, checksum]
 # Checksum:       XOR of DDC_DEVICE_ADDR and all preceding payload bytes.
 # ---------------------------------------------------------------------------
-def _build_setvcp(vcp_code: int, value: int) -> list[int]:
+def _build_setvcp(source_addr: int, vcp_code: int, value: int) -> list[int]:
     vh  = (value >> 8) & 0xFF
     vl  = value & 0xFF
-    pkt = [0x50, 0x84, 0x03, vcp_code, vh, vl]
+    pkt = [source_addr, 0x84, 0x03, vcp_code, vh, vl]
     checksum = DDC_DEVICE_ADDR
     for b in pkt:
         checksum ^= b
@@ -413,6 +457,44 @@ def _i2c_write(lib: ctypes.CDLL, gpu, masks: list[int], packet: list[int]) -> bo
     return success
 
 
+def _parse_int_arg(raw: str, name: str, min_value: int, max_value: int) -> int:
+    """Parse decimal or 0x-prefixed CLI integers with a clear range error."""
+    try:
+        value = int(raw, 0)
+    except ValueError:
+        sys.exit(f"error: {name} must be a decimal or hex value, got '{raw}'")
+    if not min_value <= value <= max_value:
+        sys.exit(
+            f"error: {name} must be between 0x{min_value:X} and 0x{max_value:X}, "
+            f"got 0x{value:X}"
+        )
+    return value
+
+
+def _send_setvcp(source_addr: int, vcp_code: int, value: int, label: str | None = None) -> bool:
+    lib        = _load_nvapi()
+    gpu, masks = _nvapi_setup(lib)
+    packet     = _build_setvcp(source_addr, vcp_code, value)
+    log(f"[debug] packet: {[f'0x{b:02X}' for b in packet]}")
+
+    success = _i2c_write(lib, gpu, masks, packet)
+    if label:
+        if success:
+            print(label)
+        else:
+            sys.exit(f"error: failed to send {label} - run with --verbose for details")
+    return success
+
+
+def _send_pbp_mode(mode: str, quiet: bool = False) -> bool:
+    if mode not in PBP_MODES:
+        valid = ", ".join(PBP_MODES)
+        sys.exit(f"error: unknown PBP mode '{mode}' - choose one of: {valid}")
+    value, label = PBP_MODES[mode]
+    result_label = None if quiet else f"set {label}"
+    return _send_setvcp(PBP_SOURCE_ADDR, PBP_VCP_CODE, value, result_label)
+
+
 # ---------------------------------------------------------------------------
 # configure / daemon commands
 # ---------------------------------------------------------------------------
@@ -499,7 +581,7 @@ def _pick_input(prompt: str, exclude: str | None = None,
         sys.stdout.flush()
 
 
-def _prompt_hotkey(ctx: dict | None = None, error: str | None = None) -> str | None:
+def _prompt_hotkey(ctx: dict | None = None, error: str | None = None, is_optional: bool = False) -> str | None:
     """Read a hotkey string character by character. Returns raw string or None if ESC pressed."""
     _clear()
     if ctx:
@@ -510,8 +592,12 @@ def _prompt_hotkey(ctx: dict | None = None, error: str | None = None) -> str | N
     _listed  = (
         f"{_DIM}, {_RESET}".join(_parts[:-1]) + f"{_DIM} and {_RESET}" + _parts[-1]
     )
-    print(f"{_BOLD}Hotkey — type it as text, e.g. {_fmt_hotkey(_example)}{_BOLD}:{_RESET}")
-    print(f"  {_DIM}the toggle will trigger when you press {_RESET}{_listed}{_DIM} together{_RESET}")
+    _title = "PBP toggle hotkey (optional)" if is_optional else "Hotkey"
+    print(f"{_BOLD}{_title} — type it as text, e.g. {_fmt_hotkey(_example)}{_BOLD}:{_RESET}")
+    if is_optional:
+        print(f"  {_DIM}leave empty and press Enter to skip{_RESET}")
+    else:
+        print(f"  {_DIM}the toggle will trigger when you press {_RESET}{_listed}{_DIM} together{_RESET}")
     hints = (
         f"  {_YELLOW}Enter{_RESET}{_DIM} confirm{_RESET}"
         f"   {_YELLOW}ESC{_RESET}{_DIM} go back{_RESET}"
@@ -551,11 +637,13 @@ def _prompt_hotkey(ctx: dict | None = None, error: str | None = None) -> str | N
 
 def cmd_configure() -> None:
     """Interactive setup — writes config.json."""
-    current      = None
-    target       = None
-    raw          = None
-    step         = 0
-    hotkey_error = None
+    current          = None
+    target           = None
+    raw              = None
+    pbp_raw          = None
+    step             = 0
+    hotkey_error     = None
+    pbp_hotkey_error = None
 
     while True:
         if step == 0:
@@ -599,11 +687,40 @@ def cmd_configure() -> None:
                 continue
             try:
                 parse_hotkey(raw)
+                pbp_hotkey_error = None
                 step = 3
             except ValueError as exc:
                 hotkey_error = str(exc)
 
         elif step == 3:
+            result = _prompt_hotkey(
+                ctx={
+                    "Currently on": _fmt_input(current),
+                    "Toggles to":   _fmt_input(target),
+                    "Input hotkey": _fmt_hotkey(raw),
+                },
+                error=pbp_hotkey_error,
+                is_optional=True,
+            )
+            if result is None:   # ESC = go back
+                pbp_hotkey_error = None
+                step             = 2
+                continue
+            pbp_str = result.strip()
+            if pbp_str:
+                try:
+                    parse_hotkey(pbp_str)
+                    pbp_raw          = pbp_str
+                    pbp_hotkey_error = None
+                    step             = 4
+                except ValueError as exc:
+                    pbp_hotkey_error = str(exc)
+            else:
+                pbp_raw          = None   # skipped
+                pbp_hotkey_error = None
+                step             = 4
+
+        elif step == 4:
             yn_options = ["Yes", "No"]
             yn_idx     = 0 if _get_startup() else 1
             n_lines    = len(yn_options) + 1
@@ -626,10 +743,12 @@ def cmd_configure() -> None:
                 sys.stdout.flush()
 
             _clear()
+            pbp_label = _fmt_hotkey(pbp_raw) if pbp_raw else f"{_DIM}(not set){_RESET}"
             _show_context({
                 "Currently on": _fmt_input(current),
                 "Toggles to":   _fmt_input(target),
-                "Hotkey":        _fmt_hotkey(raw),
+                "Input hotkey": _fmt_hotkey(raw),
+                "PBP hotkey":   pbp_label,
             })
             print(f"{_BOLD}Start with Windows?{_RESET}\n")
             sys.stdout.write("\033[?25l")
@@ -651,21 +770,29 @@ def cmd_configure() -> None:
                         _set_startup(yn_idx == 0)
                         break
                     elif ch == b"\x1b":
-                        step = 2
+                        step = 3
                         break
             finally:
                 sys.stdout.write("\033[?25h")
                 sys.stdout.flush()
 
-            if step == 2:
+            if step == 3:
                 continue
             break
 
-    cfg = {"hotkey": raw, "inputs": [current, target], "last_input": current}
+    cfg = {
+        "hotkey":     raw,
+        "inputs":     [current, target],
+        "last_input": current,
+        "pbp_hotkey": pbp_raw,
+        "pbp_on":     False,
+    }
     _save_config(cfg)
     _clear()
     print(f"  {_DIM}hotkey :{_RESET} {_fmt_hotkey(raw)}")
     print(f"  {_DIM}toggle :{_RESET} {_fmt_input(current)} {_DIM}↔{_RESET} {_fmt_input(target)}")
+    if pbp_raw:
+        print(f"  {_DIM}pbp    :{_RESET} {_fmt_hotkey(pbp_raw)}")
     print()
 
 
@@ -682,9 +809,11 @@ def _create_icon_image() -> Image.Image:
 
 def cmd_daemon() -> None:
     """Listen for the configured hotkey and operate from the system tray."""
-    cfg      = _load_config()
-    mods, vk = parse_hotkey(cfg["hotkey"])
-    inputs   = cfg["inputs"]
+    cfg        = _load_config()
+    mods, vk   = parse_hotkey(cfg["hotkey"])
+    inputs     = cfg["inputs"]
+    pbp_hotkey = cfg.get("pbp_hotkey")
+    pbp_mods, pbp_vk = parse_hotkey(pbp_hotkey) if pbp_hotkey else (None, None)
 
     _stop_event = threading.Event()
 
@@ -692,14 +821,23 @@ def cmd_daemon() -> None:
         lib        = _load_nvapi()
         gpu, masks = _nvapi_setup(lib)
 
+        # Reset last_input to the configured starting input so the toggle
+        # direction is always deterministic from a known baseline on startup.
+        cfg["last_input"] = inputs[0]
+        _save_config(cfg)
+
         user32    = ctypes.WinDLL("user32")
         WM_HOTKEY = 0x0312
         HOTKEY_ID = 1
+        PBP_HK_ID = 2
 
         if not user32.RegisterHotKey(None, HOTKEY_ID, mods | MOD_NOREPEAT, vk):
             print(f"error: RegisterHotKey failed for '{cfg['hotkey']}'")
-            import os
             os._exit(1)
+
+        if pbp_mods is not None:
+            if not user32.RegisterHotKey(None, PBP_HK_ID, pbp_mods | MOD_NOREPEAT, pbp_vk):
+                print(f"warning: RegisterHotKey failed for PBP hotkey '{pbp_hotkey}'")
 
         PM_REMOVE = 0x0001
         msg = ctypes.wintypes.MSG()
@@ -713,21 +851,35 @@ def cmd_daemon() -> None:
             if msg.message != WM_HOTKEY:
                 continue
 
-            last   = cfg.get("last_input")
-            target = inputs[1] if last == inputs[0] else inputs[0]
+            if msg.wParam == HOTKEY_ID:
+                last   = cfg.get("last_input")
+                target = inputs[1] if last == inputs[0] else inputs[0]
+                value, label = INPUTS[target]
+                packet = _build_setvcp(INPUT_SOURCE_ADDR, INPUT_VCP_CODE, value)
+                log(f"[debug] packet: {[f'0x{b:02X}' for b in packet]}")
+                if _i2c_write(lib, gpu, masks, packet):
+                    log(f"[info] switched to {target} ({label})")
+                    cfg["last_input"] = target
+                    _save_config(cfg)
+                else:
+                    log(f"[error] failed to switch to {label}")
 
-            value, label = INPUTS[target]
-            packet = _build_setvcp(VCP_CODE, value)
-            log(f"[debug] packet: {[f'0x{b:02X}' for b in packet]}")
-
-            if _i2c_write(lib, gpu, masks, packet):
-                log(f"[info] switched to {target} ({label})")
-                cfg["last_input"] = target
-                _save_config(cfg)
-            else:
-                log(f"[error] failed to switch to {label}")
+            elif msg.wParam == PBP_HK_ID:
+                new_pbp_on = not cfg.get("pbp_on", False)
+                mode = "50-50" if new_pbp_on else "off"
+                value, label = PBP_MODES[mode]
+                packet = _build_setvcp(PBP_SOURCE_ADDR, PBP_VCP_CODE, value)
+                log(f"[debug] pbp packet: {[f'0x{b:02X}' for b in packet]}")
+                if _i2c_write(lib, gpu, masks, packet):
+                    log(f"[info] PBP {label}")
+                    cfg["pbp_on"] = new_pbp_on
+                    _save_config(cfg)
+                else:
+                    log(f"[error] failed to set PBP {label}")
 
         user32.UnregisterHotKey(None, HOTKEY_ID)
+        if pbp_mods is not None:
+            user32.UnregisterHotKey(None, PBP_HK_ID)
 
     t = threading.Thread(target=hotkey_listener, daemon=True)
     t.start()
@@ -746,11 +898,21 @@ def cmd_daemon() -> None:
         
         subprocess.Popen(args, creationflags=subprocess.CREATE_NEW_CONSOLE)
 
+    def on_pbp_toggle(icon, item):
+        new_pbp_on = not cfg.get("pbp_on", False)
+        mode = "50-50" if new_pbp_on else "off"
+        def _do():
+            if _send_pbp_mode(mode, quiet=True):
+                cfg["pbp_on"] = new_pbp_on
+                _save_config(cfg)
+        threading.Thread(target=_do, daemon=True).start()
+
     icon = pystray.Icon(
-        "lg-switch", 
-        _create_icon_image(), 
-        "LG Input Switch\nHotkey active", 
+        "lg-switch",
+        _create_icon_image(),
+        "LG Input Switch\nHotkey active",
         menu=pystray.Menu(
+            pystray.MenuItem("PBP", on_pbp_toggle),
             pystray.MenuItem(
                 "Start with Windows",
                 lambda icon, item: _set_startup(not _get_startup()),
@@ -775,7 +937,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="lg-switch",
         description=(
-            "Switch the active input on an LG 45GX950A-B monitor.\n\n"
+            "Switch inputs and PBP modes on an LG 45GX950A-B monitor.\n\n"
             "Uses NVAPI raw I2C to send DDC/CI commands with source address 0x50,\n"
             "bypassing the Windows DDC/CI API which the LG silently ignores."
         ),
@@ -784,14 +946,23 @@ def _build_parser() -> argparse.ArgumentParser:
             "inputs:",
             *[f"  {k:<12} {desc}" for k, (_, desc) in INPUTS.items()],
             "",
+            "pbp modes:",
+            *[f"  {k:<12} {desc}" for k, (_, desc) in PBP_MODES.items()],
+            "",
             "commands:",
             "  scan         verify monitor is detected on I2C bus",
             "  configure    interactive setup: choose two inputs and a hotkey",
             "  daemon       listen for configured hotkey and toggle inputs",
+            "  pbp MODE     set Picture-by-Picture mode",
+            "  raw SRC VCP VALUE",
+            "               send an experimental SetVCP command",
             "",
             "examples:",
             "  lg-switch dp",
             "  lg-switch usbc",
+            "  lg-switch pbp off",
+            "  lg-switch pbp 50-50",
+            "  lg-switch raw 0x51 0xD7 0x0005",
             "  lg-switch --verbose hdmi1",
             "  lg-switch scan",
             "  lg-switch configure",
@@ -799,10 +970,13 @@ def _build_parser() -> argparse.ArgumentParser:
         ]),
     )
     parser.add_argument(
-        "input",
-        choices=[*INPUTS.keys(), "scan", "configure", "daemon"],
-        metavar="input",
-        help=f"target input or command: {{{', '.join(INPUTS)}, scan, configure, daemon}}",
+        "command",
+        nargs="+",
+        metavar="command",
+        help=(
+            "input, command, or subcommand; examples: dp, scan, pbp 50-50, "
+            "raw 0x51 0xD7 0x0005"
+        ),
     )
     parser.add_argument(
         "-v", "--verbose",
@@ -818,25 +992,54 @@ def main() -> None:
     parser = _build_parser()
     args   = parser.parse_args()
     _verbose = args.verbose
+    command = args.command
 
-    if args.input == "configure":
+    if len(command) == 1 and command[0] == "configure":
         cmd_configure()
         return
 
-    if args.input == "daemon":
+    if len(command) == 1 and command[0] == "daemon":
         cmd_daemon()
         return
+
+    if command[0] == "pbp":
+        if len(command) != 2:
+            parser.error("pbp requires exactly one mode, e.g. 'pbp off' or 'pbp 50-50'")
+        _send_pbp_mode(command[1])
+        return
+
+    if command[0] == "raw":
+        if len(command) != 4:
+            parser.error("raw requires SRC VCP VALUE, e.g. 'raw 0x51 0xD7 0x0005'")
+        source_addr = _parse_int_arg(command[1], "SRC", 0x00, 0xFF)
+        vcp_code    = _parse_int_arg(command[2], "VCP", 0x00, 0xFF)
+        value       = _parse_int_arg(command[3], "VALUE", 0x0000, 0xFFFF)
+        _send_setvcp(
+            source_addr,
+            vcp_code,
+            value,
+            f"sent raw SetVCP src=0x{source_addr:02X} vcp=0x{vcp_code:02X} value=0x{value:04X}",
+        )
+        return
+
+    if len(command) != 1:
+        parser.error(f"unknown command: {' '.join(command)}")
+
+    target = command[0]
 
     lib        = _load_nvapi()
     gpu, masks = _nvapi_setup(lib)
 
-    if args.input == "scan":
+    if target == "scan":
         print(f"connected output mask: 0x{sum(masks):08X}")
         print(f"output bit(s):         {[hex(m) for m in masks]}")
         return
 
-    value, label = INPUTS[args.input]
-    packet = _build_setvcp(VCP_CODE, value)
+    if target not in INPUTS:
+        parser.error(f"unknown input or command: {target}")
+
+    value, label = INPUTS[target]
+    packet = _build_setvcp(INPUT_SOURCE_ADDR, INPUT_VCP_CODE, value)
     log(f"[debug] packet: {[f'0x{b:02X}' for b in packet]}")
 
     if _i2c_write(lib, gpu, masks, packet):
