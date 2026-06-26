@@ -212,6 +212,11 @@ def _load_config() -> dict:
     except json.JSONDecodeError as exc:
         sys.exit(f"error: config.json is not valid JSON: {exc}")
 
+    # Migrate old pip_* keys written before the rename to pbp_*
+    for old, new in (("pip_hotkey", "pbp_hotkey"), ("pip_on", "pbp_on")):
+        if old in cfg and new not in cfg:
+            cfg[new] = cfg.pop(old)
+
     for key in ("hotkey", "inputs"):
         if key not in cfg:
             sys.exit(f"error: config.json is missing '{key}' — re-run configure")
