@@ -30,11 +30,10 @@ INPUTS = {
 }
 
 PBP_MODES = {
-    "off":     (0x01, "PBP off"),
-    "none":    (0x01, "PBP off"),
-    "50-50":   (0x05, "PBP 50/50"),
-    "split":   (0x05, "PBP 50/50"),
-    "66-33":   (0x03, "PBP 66/33 (experimental)"),
+    "off":      (0x01, "PBP off"),
+    "none":     (0x01, "PBP off"),
+    "50-50":    (0x05, "PBP 50/50"),
+    "split":    (0x03, "PBP split"),
     "unknown2": (0x02, "PBP mode 0x02 (experimental)"),
 }
 
@@ -233,8 +232,8 @@ def _load_config() -> dict:
             sys.exit(f"error: config.json pip_hotkey invalid: {exc}")
 
     pip_mode = cfg.get("pip_mode", "50-50")
-    if pip_mode not in ("50-50", "66-33"):
-        sys.exit(f"error: config.json pip_mode must be '50-50' or '66-33', got '{pip_mode}'")
+    if pip_mode not in ("50-50", "split"):
+        sys.exit(f"error: config.json pip_mode must be '50-50' or 'split', got '{pip_mode}'")
 
     return cfg
 
@@ -924,9 +923,9 @@ def cmd_daemon() -> None:
                         checked=lambda item: cfg.get("pip_mode", "50-50") == "50-50",
                     ),
                     pystray.MenuItem(
-                        "66/33 (experimental)",
-                        lambda icon, item: on_pbp_mode("66-33"),
-                        checked=lambda item: cfg.get("pip_mode", "50-50") == "66-33",
+                        "Split",
+                        lambda icon, item: on_pbp_mode("split"),
+                        checked=lambda item: cfg.get("pip_mode", "50-50") == "split",
                     ),
                     pystray.MenuItem("Off", lambda icon, item: on_pbp_mode("off")),
                 )
