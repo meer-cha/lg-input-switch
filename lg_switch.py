@@ -907,11 +907,7 @@ def cmd_daemon() -> None:
         _create_icon_image(),
         "LG Input Switch\nHotkey active",
         menu=pystray.Menu(
-            pystray.MenuItem(
-                "PBP",
-                on_pbp_toggle,
-                checked=lambda item: cfg.get("pbp_on", False),
-            ),
+            pystray.MenuItem("PBP", on_pbp_toggle),
             pystray.MenuItem(
                 "Start with Windows",
                 lambda icon, item: _set_startup(not _get_startup()),
