@@ -587,7 +587,7 @@ def _prompt_hotkey(ctx: dict | None = None, error: str | None = None, is_optiona
     _listed  = (
         f"{_DIM}, {_RESET}".join(_parts[:-1]) + f"{_DIM} and {_RESET}" + _parts[-1]
     )
-    _title = "BPB toggle hotkey (optional)" if is_optional else "Hotkey"
+    _title = "PBP toggle hotkey (optional)" if is_optional else "Hotkey"
     print(f"{_BOLD}{_title} — type it as text, e.g. {_fmt_hotkey(_example)}{_BOLD}:{_RESET}")
     if is_optional:
         print(f"  {_DIM}leave empty and press Enter to skip{_RESET}")
@@ -743,7 +743,7 @@ def cmd_configure() -> None:
                 "Currently on": _fmt_input(current),
                 "Toggles to":   _fmt_input(target),
                 "Input hotkey": _fmt_hotkey(raw),
-                "BPB hotkey":   pbp_label,
+                "PBP hotkey":   pbp_label,
             })
             print(f"{_BOLD}Start with Windows?{_RESET}\n")
             sys.stdout.write("\033[?25l")
@@ -832,7 +832,7 @@ def cmd_daemon() -> None:
 
         if pbp_mods is not None:
             if not user32.RegisterHotKey(None, PBP_HK_ID, pbp_mods | MOD_NOREPEAT, pbp_vk):
-                print(f"warning: RegisterHotKey failed for BPB hotkey '{pbp_hotkey}'")
+                print(f"warning: RegisterHotKey failed for PBP hotkey '{pbp_hotkey}'")
 
         PM_REMOVE = 0x0001
         msg = ctypes.wintypes.MSG()
@@ -866,11 +866,11 @@ def cmd_daemon() -> None:
                 packet = _build_setvcp(PBP_SOURCE_ADDR, PBP_VCP_CODE, value)
                 log(f"[debug] pbp packet: {[f'0x{b:02X}' for b in packet]}")
                 if _i2c_write(lib, gpu, masks, packet):
-                    log(f"[info] BPB {label}")
+                    log(f"[info] PBP {label}")
                     cfg["pbp_on"] = new_pbp_on
                     _save_config(cfg)
                 else:
-                    log(f"[error] failed to set BPB {label}")
+                    log(f"[error] failed to set PBP {label}")
 
         user32.UnregisterHotKey(None, HOTKEY_ID)
         if pbp_mods is not None:
@@ -908,7 +908,7 @@ def cmd_daemon() -> None:
         "LG Input Switch\nHotkey active",
         menu=pystray.Menu(
             pystray.MenuItem(
-                "BPB",
+                "PBP",
                 on_pbp_toggle,
                 checked=lambda item: cfg.get("pbp_on", False),
             ),
