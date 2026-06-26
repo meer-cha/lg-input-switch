@@ -817,6 +817,19 @@ def cmd_daemon() -> None:
         lib        = _load_nvapi()
         gpu, masks = _nvapi_setup(lib)
 
+        # Always switch to the first configured input on startup so the monitor
+        # state matches what the toggle logic expects.
+        start_input = inputs[0]
+        start_value, start_label = INPUTS[start_input]
+        start_packet = _build_setvcp(INPUT_SOURCE_ADDR, INPUT_VCP_CODE, start_value)
+        log(f"[debug] startup packet: {[f'0x{b:02X}' for b in start_packet]}")
+        if _i2c_write(lib, gpu, masks, start_packet):
+            log(f"[info] startup: set to {start_input} ({start_label})")
+            cfg["last_input"] = start_input
+            _save_config(cfg)
+        else:
+            log(f"[error] startup: failed to switch to {start_label}")
+
         user32    = ctypes.WinDLL("user32")
         WM_HOTKEY = 0x0312
         HOTKEY_ID = 1
