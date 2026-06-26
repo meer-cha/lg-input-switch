@@ -61,14 +61,14 @@ The executables will be in the `dist\` folder.
 lg-input-switch.exe
 ```
 
-On the first run it will allocate a temporary console to walk you through choosing your two inputs, hotkey, optional PIP toggle hotkey, and whether to start with Windows — then immediately vanish into your System Tray and start listening. On every subsequent run it goes straight to the System Tray.
+On the first run it will allocate a temporary console to walk you through choosing your two inputs, input-switch hotkey, optional PBP toggle hotkey, and whether to start with Windows — then immediately vanish into your System Tray and start listening. On every subsequent run it goes straight to the System Tray.
 
 - **Configure:** Right click the tray icon and select **Configure** to rebind your inputs or hotkeys at any time.
-- **PIP toggle:** Press your configured PIP hotkey to switch Picture-in-Picture on (50/50 split) or off. You can also click **PIP** in the tray menu to toggle it.
+- **PBP toggle:** Press your configured PBP hotkey to toggle Picture-by-Picture (50/50 split) on or off. You can also click **PBP** in the tray menu to do the same. While PBP is active, pressing the input-switch hotkey swaps which source appears on each half of the screen.
 - **Start with Windows:** Right click the tray icon and toggle **Start with Windows** on or off. This writes a single value to `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` — no admin rights required.
 - **Quit:** Right click the tray icon and select **Quit** to exit.
 - The last active input is remembered so it always picks up where it left off!
-- Settings are stored per-user in `%LOCALAPPDATA%\LG Input Switch\config.json`, so the executable can live in a protected or read-only folder.
+- Settings are stored per-user in `%LOCALAPPDATA%\LG Input Switch\config.json` (e.g. `C:\Users\You\AppData\Local\LG Input Switch\config.json`). The exe can live in a read-only folder since config is always written here.
 
 ### From source
 
@@ -108,26 +108,21 @@ python lg_switch.py daemon
 
 #### Picture-by-Picture
 
-The `pbp` command controls LG's Picture-by-Picture side channel.
+The `pbp` command controls LG's Picture-by-Picture (50/50 split) mode.
 
 | Command | Description |
 |---------|-------------|
-| `pbp off` | Turn PBP off |
-| `pbp none` | Turn PBP off |
 | `pbp 50-50` | Turn on 50/50 left-right PBP |
-| `pbp split` | Turn on 50/50 left-right PBP |
-| `pbp 66-33` | Try the reported 66/33 left-right mode (experimental) |
-| `pbp unknown2` | Try the reported mode value `0x02` (experimental) |
-
-Examples:
+| `pbp off` | Turn PBP off |
 
 ```
 python lg_switch.py pbp 50-50
 python lg_switch.py pbp off
-python lg_switch.py --verbose pbp 50-50
 ```
 
-The system tray menu also includes **PBP > Off**, **PBP > 50/50**, and **PBP > 66/33 (experimental)**.
+While PBP is active, switching inputs (e.g. `python lg_switch.py dp`) swaps which source appears on each half of the screen.
+
+The system tray **PBP** item toggles PBP on (50/50) or off. If you configured a PBP hotkey it does the same thing from the keyboard.
 
 #### Raw experimental command
 
