@@ -232,6 +232,10 @@ def _load_config() -> dict:
         except ValueError as exc:
             sys.exit(f"error: config.json pip_hotkey invalid: {exc}")
 
+    pip_mode = cfg.get("pip_mode", "50-50")
+    if pip_mode not in ("50-50", "66-33"):
+        sys.exit(f"error: config.json pip_mode must be '50-50' or '66-33', got '{pip_mode}'")
+
     return cfg
 
 
@@ -782,6 +786,7 @@ def cmd_configure() -> None:
         "last_input": current,
         "pip_hotkey": pip_raw,
         "pip_on":     False,
+        "pip_mode":   "50-50",
     }
     _save_config(cfg)
     _clear()
@@ -862,7 +867,7 @@ def cmd_daemon() -> None:
 
             elif msg.wParam == PIP_HK_ID:
                 new_pip_on = not cfg.get("pip_on", False)
-                mode = "50-50" if new_pip_on else "off"
+                mode = cfg.get("pip_mode", "50-50") if new_pip_on else "off"
                 value, label = PBP_MODES[mode]
                 packet = _build_setvcp(PBP_SOURCE_ADDR, PBP_VCP_CODE, value)
                 log(f"[debug] pip packet: {[f'0x{b:02X}' for b in packet]}")
@@ -897,16 +902,11 @@ def cmd_daemon() -> None:
     def on_pbp_mode(mode: str):
         def _do():
             if _send_pbp_mode(mode, quiet=True):
-                cfg["pip_on"] = mode in ("50-50", "split")
-                _save_config(cfg)
-        threading.Thread(target=_do, daemon=True).start()
-
-    def on_pip_toggle(icon, item):
-        new_pip_on = not cfg.get("pip_on", False)
-        mode = "50-50" if new_pip_on else "off"
-        def _do():
-            if _send_pbp_mode(mode, quiet=True):
-                cfg["pip_on"] = new_pip_on
+                if mode == "off":
+                    cfg["pip_on"] = False
+                else:
+                    cfg["pip_mode"] = mode
+                    cfg["pip_on"] = True
                 _save_config(cfg)
         threading.Thread(target=_do, daemon=True).start()
 
@@ -916,16 +916,19 @@ def cmd_daemon() -> None:
         "LG Input Switch\nHotkey active",
         menu=pystray.Menu(
             pystray.MenuItem(
-                "PIP",
-                on_pip_toggle,
-                checked=lambda item: cfg.get("pip_on", False),
-            ),
-            pystray.MenuItem(
                 "PBP",
                 pystray.Menu(
+                    pystray.MenuItem(
+                        "50/50",
+                        lambda icon, item: on_pbp_mode("50-50"),
+                        checked=lambda item: cfg.get("pip_mode", "50-50") == "50-50",
+                    ),
+                    pystray.MenuItem(
+                        "66/33 (experimental)",
+                        lambda icon, item: on_pbp_mode("66-33"),
+                        checked=lambda item: cfg.get("pip_mode", "50-50") == "66-33",
+                    ),
                     pystray.MenuItem("Off", lambda icon, item: on_pbp_mode("off")),
-                    pystray.MenuItem("50/50", lambda icon, item: on_pbp_mode("50-50")),
-                    pystray.MenuItem("66/33 (experimental)", lambda icon, item: on_pbp_mode("66-33")),
                 )
             ),
             pystray.MenuItem(
