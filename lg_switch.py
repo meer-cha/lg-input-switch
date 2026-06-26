@@ -226,6 +226,12 @@ def _load_config() -> dict:
     except ValueError as exc:
         sys.exit(f"error: config.json hotkey invalid: {exc}")
 
+    if cfg.get("pip_hotkey"):
+        try:
+            parse_hotkey(cfg["pip_hotkey"])
+        except ValueError as exc:
+            sys.exit(f"error: config.json pip_hotkey invalid: {exc}")
+
     return cfg
 
 
@@ -571,7 +577,7 @@ def _pick_input(prompt: str, exclude: str | None = None,
         sys.stdout.flush()
 
 
-def _prompt_hotkey(ctx: dict | None = None, error: str | None = None) -> str | None:
+def _prompt_hotkey(ctx: dict | None = None, error: str | None = None, is_optional: bool = False) -> str | None:
     """Read a hotkey string character by character. Returns raw string or None if ESC pressed."""
     _clear()
     if ctx:
@@ -582,8 +588,12 @@ def _prompt_hotkey(ctx: dict | None = None, error: str | None = None) -> str | N
     _listed  = (
         f"{_DIM}, {_RESET}".join(_parts[:-1]) + f"{_DIM} and {_RESET}" + _parts[-1]
     )
-    print(f"{_BOLD}Hotkey — type it as text, e.g. {_fmt_hotkey(_example)}{_BOLD}:{_RESET}")
-    print(f"  {_DIM}the toggle will trigger when you press {_RESET}{_listed}{_DIM} together{_RESET}")
+    _title = "PIP toggle hotkey (optional)" if is_optional else "Hotkey"
+    print(f"{_BOLD}{_title} — type it as text, e.g. {_fmt_hotkey(_example)}{_BOLD}:{_RESET}")
+    if is_optional:
+        print(f"  {_DIM}leave empty and press Enter to skip{_RESET}")
+    else:
+        print(f"  {_DIM}the toggle will trigger when you press {_RESET}{_listed}{_DIM} together{_RESET}")
     hints = (
         f"  {_YELLOW}Enter{_RESET}{_DIM} confirm{_RESET}"
         f"   {_YELLOW}ESC{_RESET}{_DIM} go back{_RESET}"
@@ -623,11 +633,13 @@ def _prompt_hotkey(ctx: dict | None = None, error: str | None = None) -> str | N
 
 def cmd_configure() -> None:
     """Interactive setup — writes config.json."""
-    current      = None
-    target       = None
-    raw          = None
-    step         = 0
-    hotkey_error = None
+    current          = None
+    target           = None
+    raw              = None
+    pip_raw          = None
+    step             = 0
+    hotkey_error     = None
+    pip_hotkey_error = None
 
     while True:
         if step == 0:
@@ -671,11 +683,40 @@ def cmd_configure() -> None:
                 continue
             try:
                 parse_hotkey(raw)
+                pip_hotkey_error = None
                 step = 3
             except ValueError as exc:
                 hotkey_error = str(exc)
 
         elif step == 3:
+            result = _prompt_hotkey(
+                ctx={
+                    "Currently on": _fmt_input(current),
+                    "Toggles to":   _fmt_input(target),
+                    "Input hotkey": _fmt_hotkey(raw),
+                },
+                error=pip_hotkey_error,
+                is_optional=True,
+            )
+            if result is None:   # ESC = go back
+                pip_hotkey_error = None
+                step             = 2
+                continue
+            pip_str = result.strip()
+            if pip_str:
+                try:
+                    parse_hotkey(pip_str)
+                    pip_raw          = pip_str
+                    pip_hotkey_error = None
+                    step             = 4
+                except ValueError as exc:
+                    pip_hotkey_error = str(exc)
+            else:
+                pip_raw          = None   # skipped
+                pip_hotkey_error = None
+                step             = 4
+
+        elif step == 4:
             yn_options = ["Yes", "No"]
             yn_idx     = 0 if _get_startup() else 1
             n_lines    = len(yn_options) + 1
@@ -698,10 +739,12 @@ def cmd_configure() -> None:
                 sys.stdout.flush()
 
             _clear()
+            pip_label = _fmt_hotkey(pip_raw) if pip_raw else f"{_DIM}(not set){_RESET}"
             _show_context({
                 "Currently on": _fmt_input(current),
                 "Toggles to":   _fmt_input(target),
-                "Hotkey":        _fmt_hotkey(raw),
+                "Input hotkey": _fmt_hotkey(raw),
+                "PIP hotkey":   pip_label,
             })
             print(f"{_BOLD}Start with Windows?{_RESET}\n")
             sys.stdout.write("\033[?25l")
@@ -723,21 +766,29 @@ def cmd_configure() -> None:
                         _set_startup(yn_idx == 0)
                         break
                     elif ch == b"\x1b":
-                        step = 2
+                        step = 3
                         break
             finally:
                 sys.stdout.write("\033[?25h")
                 sys.stdout.flush()
 
-            if step == 2:
+            if step == 3:
                 continue
             break
 
-    cfg = {"hotkey": raw, "inputs": [current, target], "last_input": current}
+    cfg = {
+        "hotkey":     raw,
+        "inputs":     [current, target],
+        "last_input": current,
+        "pip_hotkey": pip_raw,
+        "pip_on":     False,
+    }
     _save_config(cfg)
     _clear()
     print(f"  {_DIM}hotkey :{_RESET} {_fmt_hotkey(raw)}")
     print(f"  {_DIM}toggle :{_RESET} {_fmt_input(current)} {_DIM}↔{_RESET} {_fmt_input(target)}")
+    if pip_raw:
+        print(f"  {_DIM}pip    :{_RESET} {_fmt_hotkey(pip_raw)}")
     print()
 
 
@@ -754,9 +805,11 @@ def _create_icon_image() -> Image.Image:
 
 def cmd_daemon() -> None:
     """Listen for the configured hotkey and operate from the system tray."""
-    cfg      = _load_config()
-    mods, vk = parse_hotkey(cfg["hotkey"])
-    inputs   = cfg["inputs"]
+    cfg        = _load_config()
+    mods, vk   = parse_hotkey(cfg["hotkey"])
+    inputs     = cfg["inputs"]
+    pip_hotkey = cfg.get("pip_hotkey")
+    pip_mods, pip_vk = parse_hotkey(pip_hotkey) if pip_hotkey else (None, None)
 
     _stop_event = threading.Event()
 
@@ -767,11 +820,15 @@ def cmd_daemon() -> None:
         user32    = ctypes.WinDLL("user32")
         WM_HOTKEY = 0x0312
         HOTKEY_ID = 1
+        PIP_HK_ID = 2
 
         if not user32.RegisterHotKey(None, HOTKEY_ID, mods | MOD_NOREPEAT, vk):
             print(f"error: RegisterHotKey failed for '{cfg['hotkey']}'")
-            import os
             os._exit(1)
+
+        if pip_mods is not None:
+            if not user32.RegisterHotKey(None, PIP_HK_ID, pip_mods | MOD_NOREPEAT, pip_vk):
+                print(f"warning: RegisterHotKey failed for PIP hotkey '{pip_hotkey}'")
 
         PM_REMOVE = 0x0001
         msg = ctypes.wintypes.MSG()
@@ -785,21 +842,35 @@ def cmd_daemon() -> None:
             if msg.message != WM_HOTKEY:
                 continue
 
-            last   = cfg.get("last_input")
-            target = inputs[1] if last == inputs[0] else inputs[0]
+            if msg.wParam == HOTKEY_ID:
+                last   = cfg.get("last_input")
+                target = inputs[1] if last == inputs[0] else inputs[0]
+                value, label = INPUTS[target]
+                packet = _build_setvcp(INPUT_SOURCE_ADDR, INPUT_VCP_CODE, value)
+                log(f"[debug] packet: {[f'0x{b:02X}' for b in packet]}")
+                if _i2c_write(lib, gpu, masks, packet):
+                    log(f"[info] switched to {target} ({label})")
+                    cfg["last_input"] = target
+                    _save_config(cfg)
+                else:
+                    log(f"[error] failed to switch to {label}")
 
-            value, label = INPUTS[target]
-            packet = _build_setvcp(INPUT_SOURCE_ADDR, INPUT_VCP_CODE, value)
-            log(f"[debug] packet: {[f'0x{b:02X}' for b in packet]}")
-
-            if _i2c_write(lib, gpu, masks, packet):
-                log(f"[info] switched to {target} ({label})")
-                cfg["last_input"] = target
-                _save_config(cfg)
-            else:
-                log(f"[error] failed to switch to {label}")
+            elif msg.wParam == PIP_HK_ID:
+                new_pip_on = not cfg.get("pip_on", False)
+                mode = "50-50" if new_pip_on else "off"
+                value, label = PBP_MODES[mode]
+                packet = _build_setvcp(PBP_SOURCE_ADDR, PBP_VCP_CODE, value)
+                log(f"[debug] pip packet: {[f'0x{b:02X}' for b in packet]}")
+                if _i2c_write(lib, gpu, masks, packet):
+                    log(f"[info] PIP {label}")
+                    cfg["pip_on"] = new_pip_on
+                    _save_config(cfg)
+                else:
+                    log(f"[error] failed to set PIP {label}")
 
         user32.UnregisterHotKey(None, HOTKEY_ID)
+        if pip_mods is not None:
+            user32.UnregisterHotKey(None, PIP_HK_ID)
 
     t = threading.Thread(target=hotkey_listener, daemon=True)
     t.start()
@@ -819,13 +890,31 @@ def cmd_daemon() -> None:
         subprocess.Popen(args, creationflags=subprocess.CREATE_NEW_CONSOLE)
 
     def on_pbp_mode(mode: str):
-        threading.Thread(target=lambda: _send_pbp_mode(mode, quiet=True), daemon=True).start()
+        def _do():
+            if _send_pbp_mode(mode, quiet=True):
+                cfg["pip_on"] = mode in ("50-50", "split")
+                _save_config(cfg)
+        threading.Thread(target=_do, daemon=True).start()
+
+    def on_pip_toggle(icon, item):
+        new_pip_on = not cfg.get("pip_on", False)
+        mode = "50-50" if new_pip_on else "off"
+        def _do():
+            if _send_pbp_mode(mode, quiet=True):
+                cfg["pip_on"] = new_pip_on
+                _save_config(cfg)
+        threading.Thread(target=_do, daemon=True).start()
 
     icon = pystray.Icon(
-        "lg-switch", 
-        _create_icon_image(), 
-        "LG Input Switch\nHotkey active", 
+        "lg-switch",
+        _create_icon_image(),
+        "LG Input Switch\nHotkey active",
         menu=pystray.Menu(
+            pystray.MenuItem(
+                "PIP",
+                on_pip_toggle,
+                checked=lambda item: cfg.get("pip_on", False),
+            ),
             pystray.MenuItem(
                 "PBP",
                 pystray.Menu(
